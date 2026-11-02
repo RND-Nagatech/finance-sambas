@@ -3923,6 +3923,73 @@ async function loadReportForExport(report, query) {
   return reportTransactions(input);
 }
 
+const REPORT_EXPORT_COLORS = Object.freeze({
+  dark: '1D2226',
+  teal: '087C75',
+  tealLight: 'E8F4F2',
+  border: 'D5DBE0',
+  stripe: 'F7F9FA',
+  ink: '26343B',
+  muted: '6D7D84',
+  white: 'FFFFFF',
+});
+
+function reportExportFilterText(filters = {}) {
+  const groupLabels = { CASH_GROUP: 'Kelompok kas', ACCOUNT: 'Rekening', UNIT: 'Unit bisnis', BRANCH: 'Toko / cabang', CATEGORY: 'Kategori' };
+  const viewLabel = filters.view === 'detail' ? 'Detail' : filters.view === 'summary' ? 'Rekap' : '';
+  const readable = (value) => String(value || '').replaceAll('_', ' ');
+  return [
+    `Periode: ${filters.dateFrom || '-'} s.d. ${filters.dateTo || '-'}`,
+    filters.unit ? `Unit bisnis: ${filters.unit}` : '',
+    filters.kelompokKasId ? 'Kelompok kas: Terpilih' : '',
+    filters.accountId ? 'Rekening: Terpilih' : '',
+    filters.kodeToko ? `Cabang: ${filters.kodeToko}` : '',
+    filters.sourceType ? `Sumber: ${filters.sourceType === 'SYNC' ? 'NAGAGOLD' : readable(filters.sourceType)}` : '',
+    filters.groupBy ? `Kelompokkan: ${groupLabels[filters.groupBy] || filters.groupBy}` : '',
+    viewLabel ? `Tampilan: ${viewLabel}` : '',
+    filters.search ? `Pencarian: ${filters.search}` : '',
+    filters.kategoriSumber ? `Kategori: ${readable(filters.kategoriSumber)}` : '',
+    filters.metodePembayaran ? `Metode: ${readable(filters.metodePembayaran)}` : '',
+    `Status: ${readable(filters.journalStatus || 'POSTED')}`,
+  ].filter(Boolean).join('  ·  ');
+}
+
+function isExportAmountKey(key = '') {
+  return /debet|kredit|debit|credit|saldo|nominal|uang masuk|uang keluar|jumlah mutasi|confirmed/i.test(String(key));
+}
+
+function shouldExportTotalKey(key = '') {
+  return isExportAmountKey(key) && !/saldo berjalan/i.test(String(key));
+}
+
+function reportExportTotals(rows, keys) {
+  const totals = new Map();
+  keys.forEach((key) => {
+    if (!shouldExportTotalKey(key)) return;
+    const value = rows.reduce((sum, row) => sum + (typeof row[key] === 'number' ? row[key] : 0), 0);
+    if (value || rows.some((row) => typeof row[key] === 'number')) totals.set(key, value);
+  });
+  return totals;
+}
+
+function excelColumnLetter(number) {
+  let result = '';
+  let value = number;
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    result = String.fromCharCode(65 + remainder) + result;
+    value = Math.floor((value - 1) / 26);
+  }
+  return result;
+}
+
+function excelCellWidth(key, rows) {
+  const values = rows.slice(0, 300).map((row) => String(row[key] ?? ''));
+  const longest = Math.max(String(key).length, ...values.map((value) => value.length));
+  const preferred = isExportAmountKey(key) ? Math.max(longest + 2, 16) : longest + 3;
+  return Math.min(42, Math.max(13, preferred));
+}
+
 async function sendExcelExport(report, payload, res) {
   const rows = reportRowsForExport(report, payload);
   const workbook = new ExcelJS.Workbook();
@@ -3930,71 +3997,160 @@ async function sendExcelExport(report, payload, res) {
   workbook.created = new Date();
   const sheet = workbook.addWorksheet('Laporan');
   const keys = rows.length ? Object.keys(rows[0]) : ['Keterangan'];
-  sheet.columns = keys.map((key) => ({ key, width: Math.min(38, Math.max(14, key.length + 4)) }));
+  sheet.columns = keys.map((key) => ({ key, width: excelCellWidth(key, rows) }));
   const filters = payload.filters || {};
-  const filterText = [
-    `Periode: ${filters.dateFrom || '-'} s.d. ${filters.dateTo || '-'}`,
-    filters.unit ? `Unit: ${filters.unit}` : '',
-    filters.kelompokKasId ? `Kelompok kas: ${filters.kelompokKasId}` : '',
-    filters.accountId ? `Rekening: ${filters.accountId}` : '',
-    filters.kodeToko ? `Cabang: ${filters.kodeToko}` : '',
-    filters.groupBy ? `Pengelompokan: ${filters.groupBy}` : '',
-    `Status: ${filters.journalStatus || 'POSTED'}`,
-  ].filter(Boolean).join(' · ');
-  sheet.addRow(['Finance Sambas']);
+  const filterText = reportExportFilterText(filters);
+  const lastColumn = excelColumnLetter(keys.length);
+  sheet.addRow(['FINANCE SAMBAS']);
   sheet.addRow([exportTitle(report)]);
   sheet.addRow([filterText]);
-  sheet.addRow([`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`]);
+  sheet.addRow([`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}  ·  ${rows.length} data`]);
+  sheet.addRow([]);
   const headerRow = sheet.addRow(keys);
+  sheet.mergeCells(`A1:${lastColumn}1`);
+  sheet.mergeCells(`A2:${lastColumn}2`);
+  sheet.mergeCells(`A3:${lastColumn}3`);
+  sheet.mergeCells(`A4:${lastColumn}4`);
   for (const row of rows) sheet.addRow(row);
-  for (const rowNumber of [1, 2, 3, 4]) {
-    sheet.mergeCells(rowNumber, 1, rowNumber, keys.length);
-    sheet.getRow(rowNumber).alignment = { vertical: 'middle' };
+  const totalValues = reportExportTotals(rows, keys);
+  if (totalValues.size) {
+    const totalRow = sheet.addRow(keys.map((key, index) => index === 0 ? 'TOTAL' : totalValues.has(key) ? totalValues.get(key) : ''));
+    totalRow.font = { bold: true, color: { argb: REPORT_EXPORT_COLORS.ink } };
+    totalRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.tealLight } };
   }
-  sheet.getRow(1).font = { bold: true, size: 11, color: { argb: '607780' } };
-  sheet.getRow(2).font = { bold: true, size: 14, color: { argb: '163342' } };
-  sheet.getRow(3).font = { color: { argb: '607780' } };
-  sheet.getRow(4).font = { italic: true, color: { argb: '607780' } };
-  headerRow.font = { bold: true, color: { argb: 'FFFFFF' } };
-  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '087C75' } };
-  headerRow.alignment = { vertical: 'middle', wrapText: true };
+  const styleRow = (row, style = {}) => {
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      cell.alignment = { vertical: 'middle', ...style.alignment };
+      if (style.font) cell.font = style.font;
+      if (style.fill) cell.fill = style.fill;
+      if (style.border) cell.border = style.border;
+    });
+  };
+  styleRow(sheet.getRow(1), { font: { bold: true, size: 11, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.dark } }, alignment: { horizontal: 'left' } });
+  styleRow(sheet.getRow(2), { font: { bold: true, size: 15, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.dark } }, alignment: { horizontal: 'left' } });
+  styleRow(sheet.getRow(3), { font: { size: 10, color: { argb: REPORT_EXPORT_COLORS.muted } }, alignment: { horizontal: 'left', wrapText: true } });
+  styleRow(sheet.getRow(4), { font: { italic: true, size: 9, color: { argb: REPORT_EXPORT_COLORS.muted } }, alignment: { horizontal: 'left' } });
+  headerRow.height = 30;
+  styleRow(headerRow, { font: { bold: true, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.teal } }, alignment: { horizontal: 'center', vertical: 'middle', wrapText: true }, border: { top: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, bottom: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, left: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, right: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } } } });
+  for (let rowNumber = headerRow.number + 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const row = sheet.getRow(rowNumber);
+    if (rowNumber < sheet.rowCount && (rowNumber - headerRow.number) % 2 === 0) row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.stripe } };
+    row.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
+      const key = keys[columnNumber - 1];
+      cell.alignment = { vertical: 'top', horizontal: isExportAmountKey(key) ? 'right' : 'left', wrapText: true };
+      cell.border = { bottom: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } } };
+      if (typeof cell.value === 'number') cell.numFmt = isExportAmountKey(key) ? '#,##0;[Red]-#,##0' : '#,##0';
+    });
+  }
   sheet.views = [{ state: 'frozen', ySplit: headerRow.number }];
-  for (const row of sheet.getRows(headerRow.number + 1, Math.max(0, sheet.rowCount - headerRow.number)) || []) row.eachCell({ includeEmpty: false }, (cell) => { if (typeof cell.value === 'number') cell.numFmt = '#,##0'; });
+  sheet.autoFilter = { from: { row: headerRow.number, column: 1 }, to: { row: headerRow.number, column: keys.length } };
+  sheet.pageSetup = { paperSize: 9, orientation: keys.length > 7 ? 'landscape' : 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0, horizontalDpi: 300, verticalDpi: 300 };
+  sheet.pageMargins = { left: 0.25, right: 0.25, top: 0.55, bottom: 0.55, header: 0.2, footer: 0.2 };
+  sheet.printTitlesRow = `${headerRow.number}:${headerRow.number}`;
+  sheet.headerFooter.oddFooter = '&LFinance Sambas&C&D&RHalaman &P dari &N';
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="finance-${report}-${new Date().toISOString().slice(0, 10)}.xlsx"`);
   await workbook.xlsx.write(res);
   res.end();
 }
 
-function pdfText(value) { return String(value ?? '').replace(/[\\()\r\n]/g, ' ').slice(0, 160); }
+function pdfText(value) { return String(value ?? '').replace(/[\r\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180) || '-'; }
+
+function pdfDisplayValue(key, value) {
+  if (value === null || value === undefined || value === '') return '-';
+  if (typeof value === 'number' && isExportAmountKey(key)) return new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 }).format(value);
+  return pdfText(value);
+}
+
+function pdfColumnWidths(keys, rows, availableWidth) {
+  const weights = keys.map((key) => {
+    const normalized = String(key).toLowerCase();
+    if (/keterangan|deskripsi|rekening|referensi|transaksi/.test(normalized)) return 1.45;
+    if (isExportAmountKey(key)) return 0.9;
+    if (/tanggal|status|jenis|sumber|cabang|unit|mapping|approval|jurnal|arah/.test(normalized)) return 1;
+    return 1.1;
+  });
+  const totalWeight = weights.reduce((sum, value) => sum + value, 0);
+  return weights.map((weight) => availableWidth * weight / totalWeight);
+}
+
+function drawPdfTable(document, report, rows, keys, margin, startY, contentWidth) {
+  const fontSize = keys.length > 10 ? 6.4 : 7.2;
+  const cellPadding = 4;
+  const rowGap = 2;
+  const widths = pdfColumnWidths(keys, rows, contentWidth);
+  const pageBottom = () => document.page.height - 38;
+  let y = startY;
+  const drawHeader = () => {
+    const headerHeights = keys.map((key, index) => document.heightOfString(pdfText(key), { width: Math.max(20, widths[index] - cellPadding * 2), font: 'Helvetica-Bold', fontSize }));
+    const height = Math.max(24, Math.min(44, Math.max(...headerHeights) + cellPadding * 2));
+    let x = margin;
+    keys.forEach((key, index) => {
+      document.rect(x, y, widths[index], height).fillAndStroke('#087C75', '#087C75');
+      document.font('Helvetica-Bold').fontSize(fontSize).fillColor('#FFFFFF').text(pdfText(key), x + cellPadding, y + cellPadding, { width: widths[index] - cellPadding * 2, height: height - cellPadding * 2, align: isExportAmountKey(key) ? 'right' : 'left' });
+      x += widths[index];
+    });
+    y += height;
+  };
+  const drawRow = (row, index) => {
+    const values = keys.map((key) => pdfDisplayValue(key, row[key]));
+    const heights = values.map((value, columnIndex) => document.heightOfString(value, { width: Math.max(20, widths[columnIndex] - cellPadding * 2), font: 'Helvetica', fontSize }));
+    const height = Math.max(22, Math.min(68, Math.max(...heights) + cellPadding * 2 + rowGap));
+    if (y + height > pageBottom()) {
+      document.addPage();
+      document.font('Helvetica-Bold').fontSize(9).fillColor('#26343B').text(`${exportTitle(report)} (lanjutan)`, margin, 24, { width: contentWidth });
+      y = 46;
+      drawHeader();
+    }
+    let x = margin;
+    keys.forEach((key, columnIndex) => {
+      const fill = index % 2 === 1 ? '#F7F9FA' : '#FFFFFF';
+      document.rect(x, y, widths[columnIndex], height).fillAndStroke(fill, '#D5DBE0');
+      document.font('Helvetica').fontSize(fontSize).fillColor('#26343B').text(values[columnIndex], x + cellPadding, y + cellPadding, { width: widths[columnIndex] - cellPadding * 2, height: height - cellPadding * 2, align: isExportAmountKey(key) ? 'right' : 'left' });
+      x += widths[columnIndex];
+    });
+    y += height;
+  };
+  drawHeader();
+  rows.forEach(drawRow);
+  const totals = reportExportTotals(rows, keys);
+  if (totals.size) {
+    const totalValues = Object.fromEntries(keys.map((key) => [key, totals.has(key) ? totals.get(key) : key === keys[0] ? 'TOTAL' : '']));
+    drawRow(totalValues, rows.length + 1);
+  }
+  return y;
+}
 
 async function sendPdfExport(report, payload, res) {
   const rows = reportRowsForExport(report, payload);
-  const margin = report === 'financial' ? 28 : 36;
-  const document = new PDFDocument({ size: 'A4', layout: report === 'financial' ? 'landscape' : 'portrait', margin, bufferPages: true });
+  const keys = rows.length ? Object.keys(rows[0]) : ['Keterangan'];
+  const layout = keys.length > 7 || report === 'financial' ? 'landscape' : 'portrait';
+  const margin = layout === 'landscape' ? 28 : 32;
+  const document = new PDFDocument({ size: 'A4', layout, margin, bufferPages: true });
   const contentWidth = document.page.width - margin * 2;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="finance-${report}-${new Date().toISOString().slice(0, 10)}.pdf"`);
   document.pipe(res);
   document.info.Title = exportTitle(report);
   document.info.Author = 'Finance Sambas';
-  document.fontSize(16).fillColor('#163342').text(exportTitle(report));
-  document.fontSize(9).fillColor('#607780').text(`Periode: ${(payload.filters?.dateFrom || '-') } s.d. ${(payload.filters?.dateTo || '-')} · Zona waktu: Asia/Jakarta`);
-  document.text(`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`);
-  document.moveDown();
-  if (!rows.length) document.fontSize(10).fillColor('#333333').text('Tidak ada data sesuai filter.');
-  else {
-    const keys = Object.keys(rows[0]);
-    document.fontSize(8).fillColor('#163342').text(keys.join(' | '));
-    document.moveDown(0.35);
-    for (const row of rows) {
-      const line = keys.map((key) => pdfText(row[key])).join(' | ');
-      if (document.y > document.page.height - margin - 30) document.addPage().fontSize(8).fillColor('#163342').text(`${exportTitle(report)} (lanjutan)`).moveDown();
-      document.fontSize(7).fillColor('#333333').text(line, { width: contentWidth });
-    }
-  }
+  document.rect(0, 0, document.page.width, 76).fill('#1D2226');
+  document.font('Helvetica-Bold').fontSize(8).fillColor('#B7C6CB').text('FINANCE SAMBAS', margin, 16, { width: contentWidth });
+  document.font('Helvetica-Bold').fontSize(17).fillColor('#FFFFFF').text(exportTitle(report), margin, 31, { width: contentWidth });
+  document.font('Helvetica').fontSize(8).fillColor('#D4E0E3').text(`Periode: ${payload.filters?.dateFrom || '-'} s.d. ${payload.filters?.dateTo || '-'}`, margin, 57, { width: contentWidth });
+  document.y = 92;
+  document.font('Helvetica').fontSize(8).fillColor('#607780').text(reportExportFilterText(payload.filters || {}), margin, document.y, { width: contentWidth });
+  document.moveDown(0.5);
+  document.font('Helvetica-Oblique').fontSize(7.5).fillColor('#8A989D').text(`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}  ·  ${rows.length} data`, margin, document.y, { width: contentWidth });
+  document.moveDown(1.1);
+  if (!rows.length) document.font('Helvetica').fontSize(10).fillColor('#333333').text('Tidak ada data sesuai filter.', margin, document.y, { width: contentWidth });
+  else drawPdfTable(document, report, rows, keys, margin, document.y, contentWidth);
   const pages = document.bufferedPageRange();
-  for (let index = 0; index < pages.count; index++) { document.switchToPage(index); document.fontSize(8).fillColor('#607780').text(`Halaman ${index + 1} dari ${pages.count}`, margin, document.page.height - margin + 8, { align: 'right', width: contentWidth }); }
+  for (let index = 0; index < pages.count; index++) {
+    document.switchToPage(index);
+    document.moveTo(margin, document.page.height - 29).lineTo(document.page.width - margin, document.page.height - 29).strokeColor('#D5DBE0').lineWidth(.5).stroke();
+    document.font('Helvetica').fontSize(7).fillColor('#607780').text('Finance Sambas', margin, document.page.height - 22, { width: contentWidth / 2 });
+    document.text(`Halaman ${index + 1} dari ${pages.count}`, margin + contentWidth / 2, document.page.height - 22, { align: 'right', width: contentWidth / 2 });
+  }
   document.end();
 }
 

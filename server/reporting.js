@@ -440,7 +440,10 @@ export async function reportDashboard(input = {}) {
     TransferRequest.countDocuments({ status: 'PENDING_APPROVAL', ...dateQuery('requestedAt', `${filters.dateFrom}T00:00:00.000+07:00`, `${filters.dateTo}T23:59:59.999+07:00`), ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }),
     TransferRequest.countDocuments({ approval_status: 'APPROVED', payment_status: { $ne: 'SUDAH_DIBAYAR' }, ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }),
     transactionCount({ ...transactionMongoQuery(filters), source_type: 'MANUAL_ADMIN', approval_status: 'PENDING' }, { mutationOnly: true }),
-    transactionCount({ ...transactionMongoQuery(filters), isImported: true, classification_status: { $in: ['REVIEW_REQUIRED', 'BLOCKED'] } }, { nagagoldOnly: true }),
+    // Transaksi yang sudah tercatat/terhubung tidak lagi menjadi pekerjaan
+    // review, meskipun metadata klasifikasi lama masih menyimpan
+    // REVIEW_REQUIRED atau BLOCKED.
+    transactionCount({ ...transactionMongoQuery(filters), isImported: true, classification_status: { $in: ['REVIEW_REQUIRED', 'BLOCKED'] }, status: { $nin: ['TERCATAT', 'TERHUBUNG', 'GAGAL'] } }, { nagagoldOnly: true }),
     transactionCount({ ...transactionMongoQuery(filters), isImported: true, mappingStatus: { $in: ['PERLU_PEMETAAN', 'PEMETAAN_AMBIGU', 'GAGAL_MAPPING'] } }, { nagagoldOnly: true }),
     transactionCount({ ...transactionMongoQuery(filters), reconciliation_status: 'CONFLICT' }),
     SyncState.find({ sourceSystem: 'nagagold', ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }).sort({ lastSuccessAt: -1 }).limit(20).lean(),

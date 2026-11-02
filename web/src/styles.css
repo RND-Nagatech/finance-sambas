@@ -852,7 +852,7 @@ body { font-size:12px; line-height:1.5; letter-spacing:0; }
 .workspace { margin-left:220px; padding-top:50px; }
 .topbar { left:220px; height:50px; min-height:50px; padding:0 20px; }
 .brand-block { width:220px; height:50px; padding:0 22px; }
-.brand-block strong { font-size:16px; font-weight:400; letter-spacing:0; }
+.brand-block strong { font-size:24px; font-weight:600; letter-spacing:0; }
 .brand-mark { width:28px; height:28px; border-radius:5px; box-shadow:none; }
 .brand-mark::before { display:none; }
 .brand-mark::after { line-height:28px; }
@@ -1218,8 +1218,13 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .finance-mark {
   display:block;
   flex:0 0 auto;
+  width:var(--finance-mark-size, 38px);
+  height:var(--finance-mark-size, 38px);
+  object-fit:contain;
+  background:transparent;
+  border-radius:0;
   overflow:visible;
-  filter:drop-shadow(0 4px 6px rgba(32,72,73,.1));
+  filter:drop-shadow(0 2px 3px rgba(0,90,78,.12));
 }
 .login-brand .finance-mark { width:40px; height:40px; }
 .auth-loading .finance-mark { width:40px; height:40px; }
@@ -1588,6 +1593,20 @@ tbody tr:hover { background:#f7f9fa; }
 .table-wrap table th:last-child,
 .table-wrap table td:last-child { text-align:center !important; }
 .type-chip { color:#347f7b !important; background:#e7f4f3 !important; border-color:#cfe8e5 !important; box-shadow:none !important; font-weight:400 !important; }
+
+/* Export actions follow the colored action buttons used in NAGAGOLD reports. */
+.report-export-actions { align-items:stretch; }
+.report-export-actions .export-button { min-width:132px; min-height:40px; border:0 !important; border-radius:4px !important; color:#fff !important; box-shadow:none !important; font-size:12px; font-weight:600; }
+.report-export-actions .export-button:hover { transform:translateY(-1px); box-shadow:0 5px 12px rgba(30,50,60,.16) !important; }
+.report-export-actions .export-button:disabled { opacity:.55; transform:none; box-shadow:none !important; }
+.report-export-actions .export-excel { background:#198754 !important; }
+.report-export-actions .export-excel:hover { background:#157347 !important; }
+.report-export-actions .export-pdf { background:#dc3545 !important; }
+.report-export-actions .export-pdf:hover { background:#bb2d3b !important; }
+@media (max-width:760px) {
+  .report-export-actions { width:100%; justify-content:stretch; }
+  .report-export-actions .export-button { flex:1; min-width:0; }
+}
 .row-actions .row-action-edit { color:#fff !important; border:0 !important; background:#348fe2 !important; }
 .row-actions .row-action-edit:hover { color:#fff !important; border:0 !important; background:#1c75c7 !important; }
 .row-actions .row-action-delete { color:#fff !important; border:0 !important; background:#ff5b57 !important; }
@@ -1681,7 +1700,7 @@ body { font-size:12px; line-height:1.5; letter-spacing:0; }
 .workspace { margin-left:220px; padding-top:50px; }
 .topbar { left:220px; height:50px; min-height:50px; padding:0 20px; }
 .brand-block { width:220px; height:50px; padding:0 22px; }
-.brand-block strong { font-size:16px; font-weight:400; letter-spacing:0; }
+.brand-block strong { color:#596168 !important; font-size:28px; font-weight:600; letter-spacing:0; }
 .brand-mark { width:28px; height:28px; border-radius:5px; box-shadow:none; }
 .brand-mark::before { display:none; }
 .brand-mark::after { line-height:28px; }
