@@ -706,6 +706,7 @@ async function financeEntries(entries, session) {
       nama_rekening: account?.nama_rekening || '',
       debet: Number(entry.debet || 0),
       kredit: Number(entry.kredit || 0),
+      detail_faktur: Array.isArray(entry.detail_faktur) ? entry.detail_faktur : [],
       keterangan: entry.keterangan || '',
     };
   });
@@ -754,11 +755,24 @@ async function ensureInitialJournal(transaction, session) {
   return created[0];
 }
 
+function financeInvoiceNumbers(transaction) {
+  const rawDetails = Array.isArray(transaction?.sourceDetailTransaction) ? transaction.sourceDetailTransaction : [];
+  const summaryDetails = Array.isArray(transaction?.sourceInvoiceDetails) ? transaction.sourceInvoiceDetails : [];
+  const directNumbers = Array.isArray(transaction?.sourceInvoiceNumbers) ? transaction.sourceInvoiceNumbers : [];
+  const numbers = [
+    ...directNumbers,
+    ...summaryDetails.map((invoice) => invoice?.nomorFaktur || invoice?.no_faktur),
+    ...rawDetails.map((detail) => detail?.no_faktur || detail?.no_faktur_jual || detail?.no_faktur_beli),
+  ].map((value) => String(value || '').trim()).filter(Boolean);
+  return [...new Set(numbers)];
+}
+
 async function createMutationJournal(transaction, session) {
   const incoming = transaction.arahDana === 'MASUK';
   const accountId = id(transaction.rekeningId);
+  const detailFaktur = financeInvoiceNumbers(transaction);
   const [entry] = await financeEntries([
-    { rekeningId: accountId, debet: incoming ? transaction.amount : 0, kredit: incoming ? 0 : transaction.amount, keterangan: incoming ? 'Dana masuk dari transaksi Nagagold' : 'Dana keluar untuk transaksi Nagagold' },
+    { rekeningId: accountId, debet: incoming ? transaction.amount : 0, kredit: incoming ? 0 : transaction.amount, detail_faktur: detailFaktur, keterangan: incoming ? 'Dana masuk dari transaksi Nagagold' : 'Dana keluar untuk transaksi Nagagold' },
   ], session);
   return JournalEntry.create([{
     ...financePayload({ noKeuangan: await nextFinanceNumber(transaction.transactionDate, session), noTransaksi: transactionNumber(transaction), tanggal: transaction.transactionDate, tipe: financeType(transaction), entry }),
@@ -1410,11 +1424,13 @@ async function reverseTransferBalance(transaction, session) {
 async function syncAccountBalances() {
   const [accounts, openingBalances, mutations, syncTransactions] = await Promise.all([
     Account.find({}).select('_id').lean(),
-    OpeningBalance.find({ status: 'APPROVED', status_valid: true }).select('rekening_id nilai').lean(),
-    FinanceMutation.find({ status: 'APPROVED', $or: [{ journal_status: JOURNAL_STATUSES.POSTED }, { journal_status: { $exists: false } }] }).select('bentukTransaksi sourceAccountId destinationAccountId rekeningId arahDana amount').lean(),
-    SyncTransaction.find({ status: 'APPROVED', $or: [{ journal_status: JOURNAL_STATUSES.POSTED }, { journal_status: { $exists: false } }] }).select('bentukTransaksi sourceAccountId destinationAccountId rekeningId arahDana amount').lean(),
+    // Saldo awal langsung memengaruhi saldo sejak dibuat, walaupun approval
+    // Owner belum selesai. Yang dihitung ulang hanya saldo awal yang masih
+    // berstatus diterapkan; saldo yang sudah dibalik tidak ikut dihitung.
+    OpeningBalance.find({ status: { $in: ['PENDING_APPROVAL', 'APPROVED'] }, saldo_status: BALANCE_STATUSES.APPLIED }).select('rekening_id nilai').lean(),
+    FinanceMutation.find({ status: 'APPROVED', $or: [{ journal_status: JOURNAL_STATUSES.POSTED }, { journal_status: { $exists: false } }] }).select('bentuk_transaksi rekening_asal rekening_tujuan nominal arah_dana').lean(),
+    SyncTransaction.find({ status: { $in: ['TERCATAT', 'TERHUBUNG'] } }).select('rekening_id jumlah_in jumlah_out').lean(),
   ]);
-  const transactions = [...mutations, ...syncTransactions];
   const balances = new Map(accounts
     .map((account) => id(account._id))
     .filter((accountId) => mongoose.isValidObjectId(accountId))
@@ -1424,22 +1440,21 @@ async function syncAccountBalances() {
     if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
     balances.set(rekeningId, balances.get(rekeningId) + Number(item.nilai || 0));
   }
-  for (const item of transactions) {
-    if (item.bentukTransaksi === 'MUTASI_REKENING') {
-      const rekeningId = id(item.rekeningId);
-      if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
-      const sign = item.arahDana === 'MASUK' ? 1 : -1;
-      balances.set(rekeningId, balances.get(rekeningId) + (sign * Number(item.amount || 0)));
-      continue;
-    }
-    const sourceAccountId = id(item.sourceAccountId);
-    const destinationAccountId = id(item.destinationAccountId);
+  for (const item of mutations) {
+    const amount = Number(item.nominal || 0);
+    const sourceAccountId = id(item.rekening_asal);
+    const destinationAccountId = id(item.rekening_tujuan);
     if (mongoose.isValidObjectId(sourceAccountId) && balances.has(sourceAccountId)) {
-      balances.set(sourceAccountId, balances.get(sourceAccountId) - Number(item.amount || 0));
+      balances.set(sourceAccountId, balances.get(sourceAccountId) - amount);
     }
     if (mongoose.isValidObjectId(destinationAccountId) && balances.has(destinationAccountId)) {
-      balances.set(destinationAccountId, balances.get(destinationAccountId) + Number(item.amount || 0));
+      balances.set(destinationAccountId, balances.get(destinationAccountId) + amount);
     }
+  }
+  for (const item of syncTransactions) {
+    const rekeningId = id(item.rekening_id);
+    if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
+    balances.set(rekeningId, balances.get(rekeningId) + Number(item.jumlah_in || 0) - Number(item.jumlah_out || 0));
   }
   for (const [accountId, balance] of balances) {
     if (!mongoose.isValidObjectId(accountId)) continue;
@@ -1739,7 +1754,7 @@ function sourceSnapshotFingerprint(snapshot) {
     kategoriSumber: snapshot.kategoriSumber || '',
     statusSumber: snapshot.statusSumber || '',
     sourceInvoiceNumbers: snapshot.sourceInvoiceNumbers || [],
-    sourceInvoiceDetails: snapshot.sourceInvoiceDetails || [],
+    sourceDetailTransaction: snapshot.sourceDetailTransaction || [],
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
@@ -1763,7 +1778,7 @@ function buildNagagoldSourceSnapshot(item, branch) {
     sourceInputDate: item.input_date || item.inputDate || null,
     sourceDeskripsi: String(item.deskripsi || '').trim(),
     sourceKeterangan: String(item.keterangan || item.note || '').trim(),
-    sourceDetailTransaction: Array.isArray(item.detail_transaction) ? item.detail_transaction : null,
+    sourceDetailTransaction: Array.isArray(item.detail_transaction) ? item.detail_transaction : [],
     sourceInvoiceNumbers: invoiceDetails.map((detail) => detail.nomorFaktur),
     sourceInvoiceDetails: invoiceDetails,
   };
@@ -1833,8 +1848,6 @@ async function ingestNagagoldItems(branch, items) {
       sourceKey,
       source_transaction_id: sourceId,
       sourceNoReff: sourceSnapshot.sourceNoReff,
-      sourceInvoiceNumbers: sourceSnapshot.sourceInvoiceNumbers,
-      sourceInvoiceDetails: sourceSnapshot.sourceInvoiceDetails,
       sourceNoRekening: sourceSnapshot.sourceNoRekening,
       sourceKodeBank: sourceSnapshot.sourceKodeBank,
       sourceNamaBank: sourceSnapshot.sourceNamaBank,
@@ -1881,7 +1894,7 @@ async function ingestNagagoldItems(branch, items) {
     };
     if (existing) {
       const refreshData = existing.status === 'APPROVED' || existing.status === 'REJECTED'
-        ? { requestId: transactionData.requestId, statusSumber: transactionData.statusSumber, sourceIsValidate: transactionData.sourceIsValidate, sourceStatusReceive: transactionData.sourceStatusReceive, sourceNoReff: transactionData.sourceNoReff, sourceInvoiceNumbers: transactionData.sourceInvoiceNumbers, sourceInvoiceDetails: transactionData.sourceInvoiceDetails, sourceNoRekening: transactionData.sourceNoRekening, sourceKodeBank: transactionData.sourceKodeBank, sourceNamaBank: transactionData.sourceNamaBank, sourceTanggal: transactionData.sourceTanggal, sourceDeskripsi: transactionData.sourceDeskripsi, sourceKeterangan: transactionData.sourceKeterangan, sourceDetailTransaction: transactionData.sourceDetailTransaction, source_amount_in: transactionData.source_amount_in, source_amount_out: transactionData.source_amount_out, jenisSumber: transactionData.jenisSumber, kategoriSumber: transactionData.kategoriSumber, source_database_name: transactionData.source_database_name, source_transaction_id: transactionData.source_transaction_id, source_payment_method: transactionData.source_payment_method, sourceDecryptionStatus: transactionData.sourceDecryptionStatus, sourceDecryptionNote: transactionData.sourceDecryptionNote, sourceSnapshotAt: transactionData.sourceSnapshotAt, sourceSnapshotProvenance: transactionData.sourceSnapshotProvenance, sourceSnapshotFingerprint: transactionData.sourceSnapshotFingerprint, sourceSnapshotRecoveryStatus: transactionData.sourceSnapshotRecoveryStatus, sourceFinalityStatus: transactionData.sourceFinalityStatus, sourceFinalityNote: transactionData.sourceFinalityNote, mappingReason: transactionData.mappingReason, mappingCheckedAt: transactionData.mappingCheckedAt, mappingRuleKey: transactionData.mappingRuleKey, mappingCandidateIds: transactionData.mappingCandidateIds }
+        ? { requestId: transactionData.requestId, statusSumber: transactionData.statusSumber, sourceIsValidate: transactionData.sourceIsValidate, sourceStatusReceive: transactionData.sourceStatusReceive, sourceNoReff: transactionData.sourceNoReff, sourceNoRekening: transactionData.sourceNoRekening, sourceKodeBank: transactionData.sourceKodeBank, sourceNamaBank: transactionData.sourceNamaBank, sourceTanggal: transactionData.sourceTanggal, sourceDeskripsi: transactionData.sourceDeskripsi, sourceKeterangan: transactionData.sourceKeterangan, sourceDetailTransaction: transactionData.sourceDetailTransaction, source_amount_in: transactionData.source_amount_in, source_amount_out: transactionData.source_amount_out, jenisSumber: transactionData.jenisSumber, kategoriSumber: transactionData.kategoriSumber, source_database_name: transactionData.source_database_name, source_transaction_id: transactionData.source_transaction_id, source_payment_method: transactionData.source_payment_method, sourceDecryptionStatus: transactionData.sourceDecryptionStatus, sourceDecryptionNote: transactionData.sourceDecryptionNote, sourceSnapshotAt: transactionData.sourceSnapshotAt, sourceSnapshotProvenance: transactionData.sourceSnapshotProvenance, sourceSnapshotFingerprint: transactionData.sourceSnapshotFingerprint, sourceSnapshotRecoveryStatus: transactionData.sourceSnapshotRecoveryStatus, sourceFinalityStatus: transactionData.sourceFinalityStatus, sourceFinalityNote: transactionData.sourceFinalityNote, mappingReason: transactionData.mappingReason, mappingCheckedAt: transactionData.mappingCheckedAt, mappingRuleKey: transactionData.mappingRuleKey, mappingCandidateIds: transactionData.mappingCandidateIds }
         : transactionData;
       await SyncTransaction.updateOne({ _id: existing._id }, { $set: { ...refreshData, status: existing.status } });
       const reconciliation = await refreshImportedReconciliation(existing._id);
@@ -3386,8 +3399,6 @@ app.post('/api/nagagold-transactions/snapshot-recovery/apply', requireRole('OWNE
         source_transaction_id: snapshot.source_transaction_id || row.sourceId,
         source_database_name: row.sourceDatabaseName,
         sourceNoReff: snapshot.sourceNoReff,
-        sourceInvoiceNumbers: snapshot.sourceInvoiceNumbers,
-        sourceInvoiceDetails: snapshot.sourceInvoiceDetails,
         sourceNoRekening: snapshot.sourceNoRekening,
         sourceKodeBank: snapshot.sourceKodeBank,
         sourceNamaBank: snapshot.sourceNamaBank,

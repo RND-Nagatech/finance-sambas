@@ -312,6 +312,9 @@ const journalSchema = new Schema({
   debet: { type: Number, default: 0, min: 0 },
   kredit: { type: Number, default: 0, min: 0 },
   keterangan: { type: String, default: '' },
+  // Finance hanya menyimpan nomor faktur sebagai referensi. Rincian sumber
+  // tetap berada di tt_sinkronisasi.
+  detail_faktur: { type: [String], default: [] },
   created_by: { type: String, default: 'system', trim: true, lowercase: true },
   approved_by: { type: String, default: '', trim: true, lowercase: true },
   approved_at: { type: Date, default: null },
@@ -558,17 +561,9 @@ mutationSchema.index({ rekening_asal: 1, tanggal: -1 });
 mutationSchema.index({ no_request: 1, tanggal: -1 });
 mutationSchema.index({ source_type: 1, approval_status: 1, tanggal: -1 });
 mutationSchema.index({ matched_transaction_id: 1 });
-const syncInvoiceSchema = new Schema({
-  no_faktur: { type: String, required: true, trim: true },
-  jenis_faktur: { type: String, default: '', trim: true, uppercase: true },
-  nominal: { type: Number, default: 0, min: 0 },
-  is_lm: { type: Boolean, default: false },
-  is_berlian: { type: Boolean, default: false },
-  is_acc: { type: Boolean, default: false },
-}, { _id: false });
-
-// tt_sinkronisasi menyimpan ringkasan sumber dan hasil penghubungannya ke
-// Finance. Field teknis lama tidak lagi menjadi bagian dari dokumen baru.
+// tt_sinkronisasi menyimpan ringkasan sumber, snapshot detail transaksi
+// Nagagold, dan hasil penghubungannya ke Finance. Snapshot detail sengaja
+// tetap lengkap agar faktur dapat ditelusuri tanpa menyalinnya ke jurnal.
 const syncSchema = new Schema({
   sumber: { type: String, default: 'NAGAGOLD', uppercase: true, trim: true },
   kode_toko: { type: String, default: '', uppercase: true, trim: true },
@@ -582,7 +577,9 @@ const syncSchema = new Schema({
   kode_bank: { type: String, default: '', uppercase: true, trim: true },
   jumlah_in: { type: Number, default: 0, min: 0 },
   jumlah_out: { type: Number, default: 0, min: 0 },
-  detail_faktur: { type: [syncInvoiceSchema], default: [] },
+  // Snapshot detail sumber disimpan utuh agar faktur dan rincian Nagagold
+  // tetap dapat ditelusuri tanpa menyalinnya ke tt_keuangan.
+  detail_transaction: { type: [Schema.Types.Mixed], default: [] },
   request_id: { type: String, default: '', trim: true, uppercase: true },
   rekening_id: { type: Schema.Types.ObjectId, default: null },
   status_sumber: { type: String, default: '', uppercase: true, trim: true },
@@ -598,25 +595,20 @@ function syncDirection(document) {
 }
 
 function syncInvoiceLegacy(invoice = {}) {
+  const nomorFaktur = invoice.no_faktur || invoice.no_faktur_jual || invoice.no_faktur_beli || invoice.nomorFaktur || '';
   return {
-    nomorFaktur: invoice.no_faktur || '',
+    nomorFaktur,
     jenisFaktur: invoice.jenis_faktur || '',
-    nilaiFaktur: Number(invoice.nominal || 0),
+    nilaiFaktur: Number(invoice.nominal ?? invoice.harga_total ?? invoice.harga ?? invoice.harga_nota ?? invoice.nilaiFaktur ?? 0),
     isLm: Boolean(invoice.is_lm),
     isBerlian: Boolean(invoice.is_berlian),
     isAcc: Boolean(invoice.is_acc),
   };
 }
 
-function syncInvoiceCanonical(invoice = {}) {
-  return {
-    no_faktur: invoice.no_faktur || invoice.nomorFaktur || '',
-    jenis_faktur: invoice.jenis_faktur || invoice.jenisFaktur || '',
-    nominal: Number(invoice.nominal ?? invoice.nilaiFaktur ?? 0),
-    is_lm: Boolean(invoice.is_lm ?? invoice.isLm),
-    is_berlian: Boolean(invoice.is_berlian ?? invoice.isBerlian),
-    is_acc: Boolean(invoice.is_acc ?? invoice.isAcc),
-  };
+function sourceDetailRows(document) {
+  if (Array.isArray(document.detail_transaction) && document.detail_transaction.length) return document.detail_transaction;
+  return [];
 }
 
 const syncVirtuals = {
@@ -644,9 +636,9 @@ const syncVirtuals = {
   sourceAmountOut: { get: function get() { return Number(this.jumlah_out || 0); }, set: function set(value) { this.jumlah_out = Number(value || 0); } },
   source_amount_in: { get: function get() { return Number(this.jumlah_in || 0); }, set: function set(value) { this.jumlah_in = Number(value || 0); } },
   source_amount_out: { get: function get() { return Number(this.jumlah_out || 0); }, set: function set(value) { this.jumlah_out = Number(value || 0); } },
-  sourceInvoiceDetails: { get: function get() { return (this.detail_faktur || []).map(syncInvoiceLegacy); }, set: function set(value) { this.detail_faktur = (Array.isArray(value) ? value : []).map(syncInvoiceCanonical); } },
-  sourceInvoiceNumbers: { get: function get() { return (this.detail_faktur || []).map((invoice) => invoice.no_faktur); }, set: () => {} },
-  sourceDetailTransaction: { get: function get() { return (this.detail_faktur || []).map(syncInvoiceLegacy); }, set: function set(value) { this.detail_faktur = (Array.isArray(value) ? value : []).map(syncInvoiceCanonical); } },
+  sourceInvoiceDetails: { get: function get() { return sourceDetailRows(this).map(syncInvoiceLegacy).filter((invoice) => invoice.nomorFaktur); }, set: function set(value) { this.detail_transaction = Array.isArray(value) ? value : []; } },
+  sourceInvoiceNumbers: { get: function get() { return sourceDetailRows(this).map((invoice) => syncInvoiceLegacy(invoice).nomorFaktur).filter(Boolean); }, set: () => {} },
+  sourceDetailTransaction: { get: function get() { return sourceDetailRows(this); }, set: function set(value) { this.detail_transaction = Array.isArray(value) ? value : []; } },
   sourceKeterangan: { get: function get() { return this.keterangan || ''; }, set: function set(value) { this.keterangan = String(value || ''); } },
   sourceDeskripsi: { get: function get() { return this.keterangan || ''; }, set: function set(value) { this.keterangan = String(value || ''); } },
   note: { get: function get() { return this.keterangan || ''; }, set: function set(value) { this.keterangan = String(value || ''); } },
@@ -708,7 +700,7 @@ function copySyncAliases(document) {
 function translateSyncPaths(value) {
   if (Array.isArray(value)) return value.map(translateSyncPaths);
   if (!value || typeof value !== 'object' || value instanceof Date || value instanceof mongoose.Types.ObjectId) return value;
-  const aliases = { isImported: 'sumber', kodeToko: 'kode_toko', namaTokoSnapshot: 'nama_toko', sourceId: 'id_sumber', source_transaction_id: 'id_sumber', sourceNoReff: 'referensi_sumber', transactionNumber: 'referensi_sumber', transactionDate: 'tanggal', requestId: 'request_id', kategoriSumber: 'kategori', kategori_sumber: 'kategori', jenisSumber: 'jenis_pembayaran', source_payment_method: 'jenis_pembayaran', sourceNoRekening: 'no_rekening', sourceKodeBank: 'kode_bank', source_amount_in: 'jumlah_in', source_amount_out: 'jumlah_out', sourceInvoiceDetails: 'detail_faktur', sourceDetailTransaction: 'detail_faktur', statusSumber: 'status_sumber', rekeningId: 'rekening_id', mappingReason: 'catatan', sync_message: 'catatan', note: 'keterangan', sourceKeterangan: 'keterangan', sourceDeskripsi: 'keterangan' };
+  const aliases = { isImported: 'sumber', kodeToko: 'kode_toko', namaTokoSnapshot: 'nama_toko', sourceId: 'id_sumber', source_transaction_id: 'id_sumber', sourceNoReff: 'referensi_sumber', transactionNumber: 'referensi_sumber', transactionDate: 'tanggal', requestId: 'request_id', kategoriSumber: 'kategori', kategori_sumber: 'kategori', jenisSumber: 'jenis_pembayaran', source_payment_method: 'jenis_pembayaran', sourceNoRekening: 'no_rekening', sourceKodeBank: 'kode_bank', source_amount_in: 'jumlah_in', source_amount_out: 'jumlah_out', sourceDetailTransaction: 'detail_transaction', statusSumber: 'status_sumber', rekeningId: 'rekening_id', mappingReason: 'catatan', sync_message: 'catatan', note: 'keterangan', sourceKeterangan: 'keterangan', sourceDeskripsi: 'keterangan' };
   return Object.fromEntries(Object.entries(value).map(([key, nested]) => {
     if (key === 'isImported') return ['sumber', 'NAGAGOLD'];
     if (key === 'source_type' || key === 'sourceSystem' || key === 'jenis_bisnis' || key === 'jenisBisnis') return ['sumber', 'NAGAGOLD'];
@@ -750,7 +742,7 @@ function translateSyncPaths(value) {
     }
     if (['classification_status', 'classification_reason', 'classification_rule_version', 'classification_proposal', 'classification_flags', 'classified_at', 'classified_by', 'matched_transaction_id', 'matched_at', 'matched_by', 'match_method', 'match_reference', 'reconciliation_note', 'sourceDatabase', 'source_database_name', 'sourceCollection', 'sourceNamaBank', 'sourceDecryptionStatus', 'sourceDecryptionNote', 'sourceSnapshotAt', 'sourceSnapshotProvenance', 'sourceSnapshotFingerprint', 'sourceSnapshotRecoveryStatus', 'sourceFinalityStatus', 'sourceFinalityNote', 'sourceIsValidate', 'sourceStatusReceive', 'mappingStatus', 'mappingCheckedAt', 'mappingRuleKey', 'mappingCandidateIds', 'approval_status', 'payment_status', 'finance_transaction_id'].includes(key)) return [key, undefined];
     const target = aliases[key] || key;
-    if (target === 'detail_faktur' && Array.isArray(nested)) return [target, nested.map(syncInvoiceCanonical)];
+    if (target === 'detail_transaction' && Array.isArray(nested)) return [target, nested];
     if (target === 'sumber' && key === 'isImported') return [target, 'NAGAGOLD'];
     return [target, translateSyncPaths(nested)];
   }));

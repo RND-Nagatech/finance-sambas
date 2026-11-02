@@ -261,8 +261,11 @@ input[type='checkbox'] { width:15px; height:15px; accent-color:#b67b19; }
 .auto-posting-rule strong { color:var(--ink); }
 .auto-posting-rule small { color:var(--muted); font-size:12px; }
 .auto-posting-rule-actions { display:flex; align-items:center; gap:12px; flex-shrink:0; }
-.mapping-form { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; align-items:end; }
-.mapping-form-actions { display:flex; gap:10px; align-items:center; }
+.mapping-form { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; align-items:end; min-width:0; padding:0 16px 16px; }
+.mapping-form > .form-field { min-width:0; }
+.mapping-form > .form-field input, .mapping-form > .form-field select, .mapping-form > .form-field textarea { display:block; width:100%; min-width:0; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
+.mapping-form-actions { display:flex; grid-column:1 / -1; min-width:0; gap:10px; align-items:center; justify-content:flex-end; flex-wrap:wrap; }
+.mapping-form-actions .button { max-width:100%; white-space:nowrap; }
 .mapping-test-result { display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:16px; padding:13px 15px; border-radius:12px; border:1px solid #d9e4e8; background:#f5fafb; color:#31505c; }
 .mapping-test-result strong { color:#163342; }
 .mapping-test-blocked, .mapping-test-pemetaan_ambigu, .mapping-test-gagal_mapping { background:#fff5f3; border-color:#efcbc5; color:#95483e; }
@@ -277,7 +280,7 @@ input[type='checkbox'] { width:15px; height:15px; accent-color:#b67b19; }
 .proposal-audit { display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:12px; padding-top:10px; border-top:1px solid rgba(72,103,113,.15); color:#607780; font-size:11px; }
 .proposal-audit small { flex-basis:100%; color:#8a6b33; }
 @media (max-width: 1100px) { .mapping-summary-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } .mapping-form { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-@media (max-width: 720px) { .mapping-summary-grid, .recovery-summary, .mapping-form, .source-audit-summary { grid-template-columns:1fr; } .mapping-form-actions { grid-column:auto; } }
+@media (max-width: 720px) { .mapping-summary-grid, .recovery-summary, .mapping-form, .source-audit-summary { grid-template-columns:1fr; } .mapping-form { padding:0 12px 12px; } .mapping-form-actions { grid-column:1 / -1; justify-content:flex-start; } }
 @media (max-width: 720px) { .auto-posting-rule { align-items:flex-start; flex-direction:column; } .auto-posting-rule-actions { width:100%; justify-content:space-between; } }
 .dry-run-panel { display:grid; gap:18px; }
 .dry-run-note { margin:0; }
@@ -1072,6 +1075,11 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .dashboard-table-panel th:last-child, .dashboard-table-panel td:last-child { text-align:right; }
 .dashboard-table-panel td { padding-top:15px; padding-bottom:15px; }
 .dashboard-table-panel .table-secondary { margin-top:4px; }
+.report-mini-grid { display:none; }
+.dashboard-visual-grid + .dashboard-flow-panel { display:none; }
+.dashboard-grid { grid-template-columns:1fr; }
+.dashboard-grid .activity-panel { padding:0; }
+.dashboard-grid .tree-panel { display:none; }
 .dashboard-flow-panel { overflow:hidden; margin-bottom:20px; }
 .flow-summary { display:flex; align-items:center; gap:26px; padding:16px 22px 0; color:#7b8e91; font-size:10px; }
 .flow-summary span { display:inline-flex; align-items:center; gap:7px; }
@@ -1091,6 +1099,14 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .flow-point { stroke-width:2; }
 .flow-point-income { fill:#fff; stroke:#2f7fb8; }
 .flow-point-expense { fill:#fff; stroke:#d4932f; }
+.flow-hover-target { fill:transparent; cursor:crosshair; outline:none; }
+.flow-hover-target:focus { outline:none; }
+.flow-hover-line { stroke:#8ba9ae; stroke-width:1; stroke-dasharray:4 4; }
+.flow-tooltip-box { fill:#20383d; opacity:.97; }
+.flow-tooltip-title { fill:#fff; font-size:11px; font-weight:700; }
+.flow-tooltip-income, .flow-tooltip-expense { font-size:10px; font-weight:600; }
+.flow-tooltip-income { fill:#9fddf0; }
+.flow-tooltip-expense { fill:#ffd477; }
 .flow-dot, .legend-swatch { display:inline-block; flex:none; width:8px; height:8px; border-radius:50%; }
 .flow-in { background:#087c75; }
 .flow-out { background:#e5a42c; }

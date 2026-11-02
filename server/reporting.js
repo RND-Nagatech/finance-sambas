@@ -119,7 +119,10 @@ export function transactionMongoQuery(filters, { nagagoldOnly = false, mutationO
 
 async function transactionDocuments(query, options = {}) {
   const models = options.nagagoldOnly ? [SyncTransaction] : options.mutationOnly ? [FinanceMutation] : [FinanceMutation, SyncTransaction];
-  const rows = await Promise.all(models.map((model) => model.find(query).lean()));
+  // Jangan memakai lean() di sini. FinanceMutation dan SyncTransaction
+  // menyediakan alias/virtual untuk menyamakan bentuk data laporan, misalnya
+  // transactionDate, amount, rekeningId, dan sourceInvoiceNumbers.
+  const rows = await Promise.all(models.map((model) => model.find(query)));
   return rows.flat();
 }
 
@@ -477,6 +480,7 @@ export async function reportDashboard(input = {}) {
       total: accounts.reduce((sum, row) => sum + currentBalance(row), 0),
       kasUtama: totalByGroup(['KAS_UTAMA']),
       kasBesar: totalByGroup(['KAS_BESAR']),
+      kasKecil: totalByGroup(['KAS_KECIL']),
       kasBesarNagagold: totalByGroup(['KAS_BESAR'], 'NAGAGOLD'),
       kasBesarOptik: totalByGroup(['KAS_BESAR'], 'OPTIK'),
       kasTunai: accounts.filter((row) => row.bentukSaldo === 'KAS_TUNAI' || [ACCOUNT_KINDS.STORE_CASH, ACCOUNT_KINDS.CASH_ACCOUNT, ACCOUNT_KINDS.OPERATING_CASH].includes(row.jenisAkun)).reduce((sum, row) => sum + currentBalance(row), 0),
