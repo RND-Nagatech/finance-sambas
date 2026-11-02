@@ -1491,6 +1491,7 @@ tbody tr:hover { background:#f7f9fa; }
 .report-filter-grid .filter-field input,
 .report-filter-grid .filter-field select { width:100%; min-width:0; min-height:38px; box-sizing:border-box; }
 .report-filter-grid .filter-clear { align-self:end; justify-content:center; min-height:38px; }
+.report-filter-grid .report-search-button { align-self:end; justify-content:center; min-height:38px; }
 .report-table-wrap { width:100%; max-width:100%; overflow-x:auto; overflow-y:auto; }
 .report-table-wrap > table { min-width:1040px; }
 .group-balance-inline { min-width:0; margin-bottom:16px; overflow-x:auto; }
@@ -1523,6 +1524,43 @@ tbody tr:hover { background:#f7f9fa; }
 .row-actions .row-action-delete:hover { background:#e64542 !important; }
 .row-actions .row-action-edit svg,
 .row-actions .row-action-delete svg { width:19px !important; height:19px !important; color:#fff !important; stroke:#fff !important; stroke-width:2.4 !important; }
+
+/* Laporan Kas & Bank: tab, filter lanjutan, dan hierarki rekap. */
+.report-tabs { display:flex; align-items:center; gap:4px; padding:4px; border:1px solid #d5dbe0; border-radius:6px; background:#eef2f4; }
+.report-tab { min-height:38px; padding:0 18px; border:0; border-radius:4px; color:#6f7e87; background:transparent; font:inherit; font-size:11px; font-weight:700; letter-spacing:.04em; cursor:pointer; }
+.report-tab:hover { color:#236f6d; background:#e4f1f0; }
+.report-tab.active { color:#fff; background:#087c75; box-shadow:0 2px 5px rgba(8,124,117,.2); }
+.report-advanced-filter { grid-column:1/-1; display:grid; gap:12px; }
+.filter-advanced-toggle { display:inline-flex; align-items:center; justify-content:space-between; gap:8px; width:max-content; min-height:34px; padding:0 12px; border:1px solid #dbe7e6; border-radius:9px; color:#4f696e; background:#f8fbfb; font:inherit; font-size:10px; font-weight:700; cursor:pointer; }
+.filter-advanced-toggle svg { transition:transform .15s ease; }
+.filter-advanced-toggle svg.is-open { transform:rotate(180deg); }
+.report-advanced-grid { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:12px; padding:14px; border:1px solid #e4efed; border-radius:10px; background:#fbfdfc; }
+.filter-check { display:flex; align-items:center; gap:8px; min-height:38px; color:#5d7076; font-size:10px; }
+.filter-check input { width:15px !important; min-height:15px !important; accent-color:#087c75; }
+.report-number-button { display:block; width:100%; padding:0; border:0; color:#2e6670; background:transparent; font:inherit; font-size:inherit; text-align:right; cursor:pointer; }
+.report-number-button:hover { color:#087c75; text-decoration:underline; }
+.report-group-row td:last-child .report-number-button,
+.report-account-row td:last-child .report-number-button { color:#303b43; font-weight:700; }
+.report-hierarchy-label { display:flex; align-items:center; gap:6px; min-width:250px; }
+.report-hierarchy-label small { display:block; }
+.report-tree-toggle { display:inline-grid; place-items:center; width:24px; height:24px; padding:0; border:1px solid #cfe3e0; border-radius:4px; color:#087c75; background:#f4fbfa; cursor:pointer; }
+.report-group-row td { background:#f5f9f9; font-weight:700; }
+.report-group-row td:first-child { border-left:3px solid #087c75; }
+.report-account-row td:first-child { border-left:3px solid transparent; }
+.report-warning { margin:0 0 16px; }
+
+@media (max-width:900px) {
+  .report-advanced-grid { grid-template-columns:repeat(2,minmax(160px,1fr)); }
+}
+
+@media (max-width:560px) {
+  .report-advanced-grid { grid-template-columns:1fr; }
+  .report-tab { flex:1; padding:0 10px; }
+}
+.financial-summary { grid-template-columns:repeat(4,minmax(0,1fr)); }
+@media (max-width:1100px) {
+  .financial-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
 .table-wrap table th:last-child,
 .table-wrap table td:last-child { text-align:center !important; }
 .type-chip { color:#347f7b !important; background:#e7f4f3 !important; border-color:#cfe8e5 !important; box-shadow:none !important; font-weight:400 !important; }

@@ -100,7 +100,7 @@ class HttpError extends Error {
 
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 const now = () => new Date();
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
 const id = (value) => value ? value.toString() : '';
 // Audit fields menyimpan username yang stabil, bukan nama tampilan user.
 // Proses sinkronisasi tanpa sesi memakai username sistem.
@@ -1495,7 +1495,27 @@ async function ensureSafeFinanceIndexes() {
     const indexOptions = { name: 'idx_tt_keuangan_transaksi_tipe', partialFilterExpression: { no_transaksi: { $gt: '' } } };
     await JournalEntry.collection.createIndex({ no_transaksi: 1, tipe: 1 }, indexOptions);
   }
+  if (!currentJournalIndexes.some((index) => index.name === 'idx_tt_keuangan_status_tanggal_rekening')) {
+    await JournalEntry.collection.createIndex(
+      { status: 1, tanggal: 1, rekening_id: 1 },
+      { name: 'idx_tt_keuangan_status_tanggal_rekening' },
+    );
+  }
   const openingIndexes = await OpeningBalance.collection.indexes();
+  if (!openingIndexes.some((index) => index.name === 'uniq_active_opening_balance')) {
+    const duplicateActiveOpening = await OpeningBalance.collection.aggregate([
+      { $match: { status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } } },
+      { $group: { _id: '$rekening_id', count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+      { $limit: 1 },
+    ]).hasNext();
+    if (!duplicateActiveOpening) {
+      await OpeningBalance.collection.createIndex(
+        { rekening_id: 1 },
+        { unique: true, partialFilterExpression: { status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }, name: 'uniq_active_opening_balance' },
+      );
+    } else console.warn('Index saldo awal unik per rekening ditunda karena ditemukan saldo awal aktif duplikat existing.');
+  }
   if (!openingIndexes.some((index) => index.name === 'uniq_applied_opening_balance')) {
     const duplicateOpening = await OpeningBalance.collection.aggregate([
       { $match: { status: 'APPROVED', status_valid: true } },
@@ -2658,12 +2678,14 @@ app.get('/api/saldo-awal', asyncRoute(async (req, res) => {
 
 app.post('/api/saldo-awal', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (req, res) => {
   const body = req.body || {};
-  if (!body.rekeningId || !body.date || !Number(body.amount)) throw new HttpError(422, 'Rekening, tanggal, dan nilai saldo awal wajib diisi.');
+  const date = String(body.date || '').slice(0, 10);
+  if (!body.rekeningId || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number(body.amount)) throw new HttpError(422, 'Rekening, tanggal, dan nilai saldo awal wajib diisi.');
+  if (date !== today()) throw new HttpError(422, `Tanggal saldo awal harus mengikuti tanggal sistem ${today()}.`);
   const created = await withMongoTransaction(async (session) => {
     const account = await accountById(body.rekeningId, session);
-    const duplicate = await OpeningBalance.findOne({ rekening_id: body.rekeningId, tanggal: body.date, status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }).session(session);
-    if (duplicate) throw new HttpError(409, 'Saldo awal untuk rekening dan tanggal tersebut sudah tercatat atau sedang menunggu approval.');
-    const [item] = await OpeningBalance.create([{ rekening_id: body.rekeningId, kategori_sistem: 'SALDO AWAL', kategori_transaksi: 'SALDO AWAL', tanggal: body.date, nilai: Number(body.amount), keterangan: String(body.note || '').trim().toUpperCase(), status: 'PENDING_APPROVAL', status_valid: false, saldo_status: BALANCE_STATUSES.APPLIED, created_by: actor(req), applied_by: actor(req), applied_at: now() }], { session });
+    const duplicate = await OpeningBalance.findOne({ rekening_id: body.rekeningId, status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }).session(session);
+    if (duplicate) throw new HttpError(409, 'Rekening tersebut sudah memiliki saldo awal atau saldo awalnya sedang menunggu approval.');
+    const [item] = await OpeningBalance.create([{ rekening_id: body.rekeningId, kategori_sistem: 'SALDO AWAL', kategori_transaksi: 'SALDO AWAL', tanggal: date, nilai: Number(body.amount), keterangan: String(body.note || '').trim().toUpperCase(), status: 'PENDING_APPROVAL', status_valid: false, saldo_status: BALANCE_STATUSES.APPLIED, created_by: actor(req), applied_by: actor(req), applied_at: now() }], { session });
     const journal = await ensureOpeningJournal(item, session, actor(req), 'PROVISIONAL');
     const accountUpdate = await Account.updateOne({ _id: account._id, aktif: true }, { $inc: { saldo_akhir: item.nilai } }, { session });
     if (accountUpdate.modifiedCount !== 1) throw new HttpError(409, 'Saldo awal tidak dapat diterapkan pada rekening.');
@@ -3726,8 +3748,15 @@ async function approveOrRejectOpeningBalances(ids, action, reason = '', req) {
           if (item.saldo_status === BALANCE_STATUSES.APPLIED) {
             const reversal = await ensureOpeningReversalJournal(item, openingJournal, session, actor(req));
             if (!reversal) throw new HttpError(409, 'Jurnal saldo awal tidak ditemukan sehingga saldo tidak dapat dibalik.');
-            const accountUpdate = await Account.updateOne({ _id: item.rekening_id, aktif: true, saldo_akhir: { $gte: item.nilai } }, { $inc: { saldo_akhir: -item.nilai } }, { session });
-            if (accountUpdate.modifiedCount !== 1) throw new HttpError(422, 'Saldo rekening tidak cukup untuk membalik saldo awal.');
+            const account = await Account.findOne({ _id: item.rekening_id, aktif: true }).session(session);
+            if (!account) throw new HttpError(422, 'Rekening aktif untuk saldo awal tidak ditemukan sehingga jurnal balik tidak dapat diterapkan.');
+            const currentBalance = Number(account.saldo_akhir || 0);
+            if (currentBalance >= Number(item.nilai)) {
+              account.saldo_akhir = currentBalance - Number(item.nilai);
+              await account.save({ session });
+            } else if (currentBalance !== 0) {
+              throw new HttpError(422, 'Saldo rekening tidak cukup untuk membalik saldo awal tanpa membuat saldo negatif.');
+            }
             if (openingJournal.status !== 'REVERSED') { openingJournal.status = 'REVERSED'; await openingJournal.save({ session }); }
             item.saldo_status = BALANCE_STATUSES.REVERSED;
             item.jurnal_balik_id = reversal.no_keuangan;
@@ -3790,7 +3819,7 @@ app.get('/api/reports/journals', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), re
 app.get('/api/reports/reconciliation', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), reportHandler(reportReconciliation));
 
 function exportTitle(report) {
-  return ({ financial: 'Laporan Keuangan', balances: 'Saldo Kas dan Rekening', transactions: 'Semua Transaksi Finance', integrated: 'Transaksi Terintegrasi Nagagold', 'nagagold-source': 'Pergerakan Sumber Nagagold', 'nagagold-cash': 'Laporan Cash Nagagold', 'nagagold-accounts': 'Laporan Rekening Nagagold', mutations: 'Mutasi Antar Kas', requests: 'Request dan Approval', journals: 'Jurnal dan Buku Besar', reconciliation: 'Rekonsiliasi Nagagold' }[report] || 'Laporan Finance');
+  return ({ financial: 'Laporan Kas & Bank', balances: 'Saldo Kas dan Rekening', transactions: 'Semua Transaksi Finance', integrated: 'Transaksi Terintegrasi Nagagold', 'nagagold-source': 'Pergerakan Sumber Nagagold', 'nagagold-cash': 'Laporan Cash Nagagold', 'nagagold-accounts': 'Laporan Rekening Nagagold', mutations: 'Mutasi Antar Kas', requests: 'Request dan Approval', journals: 'Jurnal dan Buku Besar', reconciliation: 'Rekonsiliasi Nagagold' }[report] || 'Laporan Finance');
 }
 
 async function loadReportForExport(report, query) {
@@ -3815,16 +3844,36 @@ async function sendExcelExport(report, payload, res) {
   workbook.created = new Date();
   const sheet = workbook.addWorksheet('Laporan');
   const keys = rows.length ? Object.keys(rows[0]) : ['Keterangan'];
-  sheet.columns = keys.map((key) => ({ header: key, key, width: Math.min(38, Math.max(14, key.length + 4)) }));
+  sheet.columns = keys.map((key) => ({ key, width: Math.min(38, Math.max(14, key.length + 4)) }));
+  const filters = payload.filters || {};
+  const filterText = [
+    `Periode: ${filters.dateFrom || '-'} s.d. ${filters.dateTo || '-'}`,
+    filters.unit ? `Unit: ${filters.unit}` : '',
+    filters.kelompokKasId ? `Kelompok kas: ${filters.kelompokKasId}` : '',
+    filters.accountId ? `Rekening: ${filters.accountId}` : '',
+    filters.kodeToko ? `Cabang: ${filters.kodeToko}` : '',
+    filters.groupBy ? `Pengelompokan: ${filters.groupBy}` : '',
+    `Status: ${filters.journalStatus || 'POSTED'}`,
+  ].filter(Boolean).join(' · ');
+  sheet.addRow(['Finance Sambas']);
+  sheet.addRow([exportTitle(report)]);
+  sheet.addRow([filterText]);
+  sheet.addRow([`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`]);
+  const headerRow = sheet.addRow(keys);
   for (const row of rows) sheet.addRow(row);
-  sheet.insertRow(1, [`${exportTitle(report)} | Dibuat ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`]);
-  sheet.mergeCells(1, 1, 1, keys.length);
-  sheet.getRow(1).font = { bold: true, size: 14, color: { argb: '163342' } };
-  sheet.getRow(1).alignment = { vertical: 'middle' };
-  sheet.getRow(2).font = { bold: true, color: { argb: 'FFFFFF' } };
-  sheet.getRow(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '087C75' } };
-  sheet.views = [{ state: 'frozen', ySplit: 2 }];
-  for (const row of sheet.getRows(3, Math.max(0, sheet.rowCount - 2)) || []) row.eachCell({ includeEmpty: false }, (cell) => { if (typeof cell.value === 'number') cell.numFmt = '#,##0'; });
+  for (const rowNumber of [1, 2, 3, 4]) {
+    sheet.mergeCells(rowNumber, 1, rowNumber, keys.length);
+    sheet.getRow(rowNumber).alignment = { vertical: 'middle' };
+  }
+  sheet.getRow(1).font = { bold: true, size: 11, color: { argb: '607780' } };
+  sheet.getRow(2).font = { bold: true, size: 14, color: { argb: '163342' } };
+  sheet.getRow(3).font = { color: { argb: '607780' } };
+  sheet.getRow(4).font = { italic: true, color: { argb: '607780' } };
+  headerRow.font = { bold: true, color: { argb: 'FFFFFF' } };
+  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '087C75' } };
+  headerRow.alignment = { vertical: 'middle', wrapText: true };
+  sheet.views = [{ state: 'frozen', ySplit: headerRow.number }];
+  for (const row of sheet.getRows(headerRow.number + 1, Math.max(0, sheet.rowCount - headerRow.number)) || []) row.eachCell({ includeEmpty: false }, (cell) => { if (typeof cell.value === 'number') cell.numFmt = '#,##0'; });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="finance-${report}-${new Date().toISOString().slice(0, 10)}.xlsx"`);
   await workbook.xlsx.write(res);
@@ -3835,7 +3884,9 @@ function pdfText(value) { return String(value ?? '').replace(/[\\()\r\n]/g, ' ')
 
 async function sendPdfExport(report, payload, res) {
   const rows = reportRowsForExport(report, payload);
-  const document = new PDFDocument({ size: 'A4', margin: 36, bufferPages: true });
+  const margin = report === 'financial' ? 28 : 36;
+  const document = new PDFDocument({ size: 'A4', layout: report === 'financial' ? 'landscape' : 'portrait', margin, bufferPages: true });
+  const contentWidth = document.page.width - margin * 2;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="finance-${report}-${new Date().toISOString().slice(0, 10)}.pdf"`);
   document.pipe(res);
@@ -3852,12 +3903,12 @@ async function sendPdfExport(report, payload, res) {
     document.moveDown(0.35);
     for (const row of rows) {
       const line = keys.map((key) => pdfText(row[key])).join(' | ');
-      if (document.y > 760) document.addPage().fontSize(8).fillColor('#163342').text(`${exportTitle(report)} (lanjutan)`).moveDown();
-      document.fontSize(7).fillColor('#333333').text(line, { width: 520 });
+      if (document.y > document.page.height - margin - 30) document.addPage().fontSize(8).fillColor('#163342').text(`${exportTitle(report)} (lanjutan)`).moveDown();
+      document.fontSize(7).fillColor('#333333').text(line, { width: contentWidth });
     }
   }
   const pages = document.bufferedPageRange();
-  for (let index = 0; index < pages.count; index++) { document.switchToPage(index); document.fontSize(8).fillColor('#607780').text(`Halaman ${index + 1} dari ${pages.count}`, 36, 790, { align: 'right', width: 520 }); }
+  for (let index = 0; index < pages.count; index++) { document.switchToPage(index); document.fontSize(8).fillColor('#607780').text(`Halaman ${index + 1} dari ${pages.count}`, margin, document.page.height - margin + 8, { align: 'right', width: contentWidth }); }
   document.end();
 }
 

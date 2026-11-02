@@ -316,6 +316,7 @@ const journalSchema = new Schema({
 }, { timestamps: { createdAt: 'dibuat_pada', updatedAt: 'diubah_pada' }, collection: collectionName('tt_keuangan'), versionKey: false, autoIndex: false });
 journalSchema.index({ no_transaksi: 1, tipe: 1 }, { name: 'idx_tt_keuangan_transaksi_tipe' });
 journalSchema.index({ rekening_id: 1, tanggal: 1 }, { name: 'idx_tt_keuangan_rekening_tanggal' });
+journalSchema.index({ status: 1, tanggal: 1, rekening_id: 1 }, { name: 'idx_tt_keuangan_status_tanggal_rekening' });
 journalSchema.index({ no_keuangan: 1 }, { unique: true, name: 'uniq_tt_keuangan_no_keuangan' });
 journalSchema.pre('validate', function validateFinanceEntry(next) {
   const debit = Number(this.debet || 0);
