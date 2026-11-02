@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { Account, BusinessType, CashType, FinanceMutation, JournalEntry, OpeningBalance, SyncState, SyncTransaction, TransferRequest } from './models.js';
 import { ACCOUNT_KINDS } from './models.js';
 import { isCashPayment, isNagagoldInternalTransfer } from './reconciliation.js';
@@ -241,7 +242,10 @@ export async function reportTransactions(input = {}, options = {}) {
   const allTransactions = sortTransactionRows(await transactionDocuments(query, options), filters);
   const total = allTransactions.length;
   const transactions = allTransactions.slice((filters.page - 1) * filters.pageSize, filters.page * filters.pageSize);
-  const accountIds = [...new Set(transactions.flatMap((item) => [item.sourceAccountId, item.destinationAccountId, item.rekeningId]).map((value) => String(value || '')).filter(Boolean))];
+  const accountIds = [...new Set(transactions
+    .flatMap((item) => [item.sourceAccountId, item.destinationAccountId, item.rekeningId])
+    .map((value) => String(value || ''))
+    .filter((value) => mongoose.isValidObjectId(value)))];
   const [accounts, journals] = await Promise.all([
     Account.find({ _id: { $in: accountIds } }).lean(),
     JournalEntry.find({ no_transaksi: { $in: transactions.map((item) => String(item.transactionNumber || '')) } }).sort({ tanggal: -1 }).lean(),
@@ -702,7 +706,7 @@ function financialCategory(journal, transaction = {}) {
 }
 
 function financialSearchText(row) {
-  return [row.transactionNumber, row.journalNumber, row.accountNumber, row.accountName, row.category, row.reference, row.description, row.kodeToko, row.namaToko].filter(Boolean).join(' ').toLowerCase();
+  return [row.source, row.transactionNumber, row.journalNumber, row.accountNumber, row.accountName, row.category, row.reference, row.description, row.kodeToko, row.namaToko].filter(Boolean).join(' ').toLowerCase();
 }
 
 function financialRowFromEntry(journal, transaction, opening, account) {
@@ -811,6 +815,8 @@ function sumFinancialStats(rows) {
 }
 
 function financialDetailMatches(row, filters) {
+  if (filters.sourceType === 'FINANCE' && row.source !== 'FINANCE') return false;
+  if (filters.sourceType === 'NAGAGOLD' && row.source !== 'NAGAGOLD') return false;
   if (filters.kategoriKeuangan && row.categoryCode !== filters.kategoriKeuangan && row.category !== filters.kategoriKeuangan) return false;
   if (filters.jenisTransaksi && row.journalType !== filters.jenisTransaksi && String(row.transactionType || '').toUpperCase() !== filters.jenisTransaksi) return false;
   if (filters.nomorKeuangan && !String(row.journalNumber).toLowerCase().includes(filters.nomorKeuangan.toLowerCase())) return false;
@@ -984,8 +990,11 @@ export async function reportFinancial(input = {}) {
     const opening = openingMap.get(String(journal.no_keuangan || journal.no_jurnal));
     return financialRowFromEntry(journal, transaction, opening, accountDetails.get(String(journal.rekening_id)) || { name: journal.nama_rekening, accountNumber: journal.no_rekening, accountCode: journal.no_rekening, cashGroupId: '' });
   });
+  const sourceFilteredEntries = ['FINANCE', 'NAGAGOLD'].includes(filters.sourceType)
+    ? entries.filter((row) => row.source === filters.sourceType)
+    : entries;
   const accountEntries = new Map();
-  for (const row of entries) accountEntries.set(row.accountId, [...(accountEntries.get(row.accountId) || []), row]);
+  for (const row of sourceFilteredEntries) accountEntries.set(row.accountId, [...(accountEntries.get(row.accountId) || []), row]);
   const accountRows = accounts.map((account) => {
     const accountId = String(account._id);
     const details = accountDetails.get(accountId) || {};
@@ -1017,7 +1026,7 @@ export async function reportFinancial(input = {}) {
     };
   }).filter((row) => filters.includeEmptyAccounts || row.hasTransactions);
   const accountRowMap = new Map(accountRows.map((row) => [row.accountId, row]));
-  const periodEntries = entries.filter((row) => row.date >= filters.dateFrom && row.date <= filters.dateTo);
+  const periodEntries = sourceFilteredEntries.filter((row) => row.date >= filters.dateFrom && row.date <= filters.dateTo);
   const runningByAccount = new Map(accountRows.map((row) => [row.accountId, row.saldoSebelumPeriode || 0]));
   const detailWithBalance = periodEntries.map((row) => {
     const previous = Number(runningByAccount.get(row.accountId) || 0);
@@ -1083,6 +1092,7 @@ export function reportRowsForExport(report, payload) {
       'No. Keuangan': row.journalNumber,
       'No. Transaksi': row.transactionNumber,
       Rekening: row.accountLabel,
+      Sumber: row.source,
       Jenis: row.category,
       Keterangan: row.description,
       Debet: Number((row.reportDebit ?? row.debit) || 0),

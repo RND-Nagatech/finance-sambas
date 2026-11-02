@@ -53,6 +53,7 @@ import {
   candidateIsUseful,
   isCashPayment,
   isNagagoldInternalTransfer,
+  normalizeNagagoldValue,
   reconciliationApplicable,
   sourcePaymentMethod,
 } from './reconciliation.js';
@@ -342,6 +343,25 @@ function reconciliationStatusLabel(value) {
   }[value] || value || '-';
 }
 
+function integrationStatus(raw = {}, { isImported = Boolean(raw.isImported) } = {}) {
+  if (!isImported) return { code: 'FINANCE', label: 'Finance', reason: '' };
+  const category = String(raw.kategoriSumber || raw.kategori_sistem || '').trim().toUpperCase();
+  const journalStatus = inferJournalStatus(raw);
+  const saldoStatus = raw.saldo_status || '';
+  const reconciliation = raw.reconciliation_status || '';
+  const mapping = raw.mappingStatus || '';
+  const requestId = String(raw.requestId || '').trim();
+  if (category === 'SALDO AWAL' || category === 'SALDO_AWAL') return { code: 'NOT_PROCESSED', label: 'Tidak diproses', reason: 'Saldo awal Nagagold dicatat melalui menu saldo awal Finance.' };
+  if (journalStatus === JOURNAL_STATUSES.POSTED && (saldoStatus === BALANCE_STATUSES.APPLIED || !saldoStatus) || reconciliation === RECONCILIATION_STATUSES.MATCHED) {
+    return { code: 'RECORDED', label: 'Tercatat', reason: raw.sync_message || 'Sudah tercatat di saldo Finance.' };
+  }
+  if ([SYNC_STATUSES.FAILED, SYNC_STATUSES.MAPPING_FAILED].includes(raw.sync_status) || raw.status === 'REJECTED') return { code: 'FAILED', label: 'Gagal', reason: raw.sync_message || raw.mappingReason || raw.rejection_reason || 'Transaksi tidak dapat dicatat.' };
+  if (requestId && reconciliation !== RECONCILIATION_STATUSES.MATCHED) return { code: 'WAITING_REQUEST', label: 'Menunggu pencocokan request', reason: raw.reconciliation_note || 'Menunggu mutasi Finance yang sesuai.' };
+  if (mapping !== 'TERPETAKAN' || !raw.rekeningId) return { code: 'WAITING_MAPPING', label: 'Menunggu pemetaan rekening', reason: raw.mappingReason || 'Rekening Finance belum ditemukan.' };
+  if (String(raw.statusSumber || '').toUpperCase() && String(raw.statusSumber).toUpperCase() !== 'OPEN') return { code: 'NEEDS_REVIEW', label: 'Perlu diperiksa', reason: raw.sync_message || `Status sumber ${String(raw.statusSumber).toUpperCase()} belum dapat diproses.` };
+  return { code: 'NEEDS_REVIEW', label: 'Perlu diperiksa', reason: raw.sync_message || raw.classification_reason || 'Transaksi menunggu pemeriksaan.' };
+}
+
 function serializeTransaction(item, accountsById = new Map()) {
   const raw = item.toObject ? item.toObject() : item;
   const sourceId = id(raw.sourceAccountId);
@@ -354,11 +374,19 @@ function serializeTransaction(item, accountsById = new Map()) {
   const journalStatus = inferJournalStatus(raw);
   const classificationStatus = raw.classification_status || (raw.isImported ? NAGAGOLD_CLASSIFICATION_STATUSES.REVIEW_REQUIRED : '');
   const isImported = Boolean(raw.isImported || sourceType === SOURCE_TYPES.SYNC || sourceType === SOURCE_TYPES.SYNC_NAGAGOLD || sourceType === SOURCE_TYPES.SYNC_OPTIK);
+  const integration = integrationStatus(raw, { isImported });
   const displayReconciliationStatus = isImported && !isNagagoldInternalTransfer(raw) && !raw.matched_transaction_id
     ? RECONCILIATION_STATUSES.NOT_APPLICABLE
     : (raw.reconciliation_status || (raw.matched_transaction_id ? RECONCILIATION_STATUSES.MATCHED : RECONCILIATION_STATUSES.NOT_APPLICABLE));
   const jenisBisnis = String(raw.jenis_bisnis || raw.jenisBisnis || (raw.isImported ? raw.sourceSystem : '') || '').trim().toUpperCase();
-  const kategoriSistem = raw.kategori_sistem || (!isImported && (String(raw.jenisRequest || '').toUpperCase() === 'MUTASI_REKENING' || String(raw.bentukTransaksi || '').toUpperCase() === 'MUTASI_REKENING') ? 'MUTASI' : 'TRANSAKSI');
+  const mutationRecord = !isImported && (
+    String(raw.kategori_sistem || '').toUpperCase() === 'MUTASI'
+    || String(raw.jenis_transaksi || raw.jenisTransaksi || '').toUpperCase() === 'MUTASI'
+    || String(raw.jenis_request || raw.jenisRequest || '').toUpperCase() === 'MUTASI_REKENING'
+    || String(raw.bentuk_transaksi || raw.bentukTransaksi || '').toUpperCase() === 'MUTASI_REKENING'
+    || String(raw.no_mutasi || raw.transactionNumber || '').toUpperCase().startsWith('MTS-')
+  );
+  const kategoriSistem = mutationRecord ? 'MUTASI' : (raw.kategori_sistem || 'TRANSAKSI');
   const createdBy = raw.created_by || raw.createdBy || 'system';
   const approvedBy = raw.approved_by || raw.approvedBy || '';
   const approvedAt = raw.approved_at || raw.approvedAt || null;
@@ -387,7 +415,7 @@ function serializeTransaction(item, accountsById = new Map()) {
     syncStatus,
     syncStatusLabel: syncStatusLabel(syncStatus),
     sourceProcessingStatus: journalStatus === JOURNAL_STATUSES.POSTED ? 'POSTED' : syncStatus,
-    sourceProcessingStatusLabel: journalStatus === JOURNAL_STATUSES.POSTED ? 'Terposting' : syncStatusLabel(syncStatus),
+    sourceProcessingStatusLabel: journalStatus === JOURNAL_STATUSES.POSTED ? 'Tercatat' : syncStatusLabel(syncStatus),
     approval_status: approvalStatus,
     approvalStatus,
     approvalStatusLabel: approvalStatusLabel(approvalStatus),
@@ -460,18 +488,17 @@ function serializeTransaction(item, accountsById = new Map()) {
     sourceAccountName: accountsById.get(sourceId) || sourceId,
     destinationAccountName: accountsById.get(destinationId) || destinationId,
     rekeningName: accountsById.get(rekeningId) || rekeningId,
+    integrationStatus: integration.code,
+    integrationStatusLabel: integration.label,
+    integrationReason: integration.reason,
   };
 }
 
 function nagagoldTransactionQuery(extra = {}) {
   return {
-    isImported: true,
+    sumber: 'NAGAGOLD',
     $and: [
-      { $or: [{ jenis_bisnis: 'NAGAGOLD' }, { sourceSystem: 'nagagold' }] },
-      // SALDO AWAL Nagagold bukan transaksi pergerakan kas Finance. Record
-      // lama tetap dipertahankan untuk audit, tetapi tidak ditampilkan atau
-      // diproses ulang sebagai transaksi terintegrasi.
-      { kategoriSumber: { $ne: 'SALDO AWAL' } },
+      { kategori: { $ne: 'SALDO AWAL' } },
       extra,
     ],
   };
@@ -884,6 +911,18 @@ async function reconcileImportedByRequestId(transactionId) {
     return { status: RECONCILIATION_STATUSES.CONFLICT, candidates: 0, note };
   }
 
+  const manualPosted = manual.status === 'APPROVED'
+    && manual.journal_status === JOURNAL_STATUSES.POSTED
+    && (manual.saldo_status === BALANCE_STATUSES.APPLIED || !manual.saldo_status);
+  if (!manualPosted) {
+    const note = `Realisasi Finance untuk request_id ${requestId} belum terposting. Transaksi Nagagold tidak menambah saldo Finance.`;
+    await SyncTransaction.updateOne(
+      { _id: imported._id, matched_transaction_id: { $in: ['', null] } },
+      { $set: { reconciliation_status: RECONCILIATION_STATUSES.UNMATCHED, reconciliation_note: note, sync_status: SYNC_STATUSES.NEEDS_REVIEW, sync_message: note } },
+    );
+    return { status: RECONCILIATION_STATUSES.UNMATCHED, candidates: 0, note };
+  }
+
   const importedJournal = await findTransactionJournal(imported);
   if (importedJournal) {
     const note = 'Transaksi Nagagold sudah memiliki jurnal; pasangan request_id tidak diubah otomatis untuk mencegah perubahan saldo historical.';
@@ -901,6 +940,9 @@ async function reconcileImportedByRequestId(transactionId) {
       const matchReference = `REQUEST:${requestId}`;
       const common = {
         reconciliation_status: RECONCILIATION_STATUSES.MATCHED,
+        // tt_sinkronisasi menyimpan nomor keuangan sebagai referensi bisnis
+        // yang mudah dibaca; tidak perlu menyimpan object id pasangan lama.
+        no_keuangan: String(currentManual.transactionNumber || currentManual.no_transaksi || request.finance_transaction_id || '').trim(),
         matched_at: matchedAt,
         matched_by: 'Sync Nagagold',
         match_method: MATCH_METHODS.REQUEST_ID,
@@ -1091,15 +1133,18 @@ async function postImportedNagagoldTransaction(transactionId) {
 
       const journal = await ensureMutationJournal(current, session);
       const amount = Number(current.amount || 0);
+      // Transaksi Nagagold tetap harus dibukukan walaupun saldo Finance saat
+      // ini nol atau menjadi negatif. Saldo aktual mengikuti urutan transaksi;
+      // saldo awal yang dicatat belakangan tidak boleh menghilangkan transaksi
+      // keluar yang sudah terjadi.
       const accountQuery = { _id: current.rekeningId, aktif: true };
-      if (current.arahDana === 'KELUAR') accountQuery.saldo_akhir = { $gte: amount };
       const accountUpdate = await Account.updateOne(accountQuery, { $inc: { saldo_akhir: current.arahDana === 'MASUK' ? amount : -amount } }, { session });
-      if (accountUpdate.modifiedCount !== 1) throw new HttpError(422, `Saldo rekening tidak cukup atau rekening tidak aktif untuk ${current.transactionNumber}.`);
+      if (accountUpdate.modifiedCount !== 1) throw new HttpError(422, `Rekening tidak ditemukan atau tidak aktif untuk ${current.transactionNumber}.`);
       journal.status = JOURNAL_STATUSES.POSTED;
       journal.approved_by = 'system';
       journal.approved_at = journal.approved_at || now();
       await journal.save({ session });
-      current.status = 'APPROVED';
+      current.status = 'TERCATAT';
       current.statusValid = true;
       current.approval_status = APPROVAL_STATUSES.NOT_REQUIRED;
       current.approved_by = 'system';
@@ -1370,18 +1415,36 @@ async function syncAccountBalances() {
     SyncTransaction.find({ status: 'APPROVED', $or: [{ journal_status: JOURNAL_STATUSES.POSTED }, { journal_status: { $exists: false } }] }).select('bentukTransaksi sourceAccountId destinationAccountId rekeningId arahDana amount').lean(),
   ]);
   const transactions = [...mutations, ...syncTransactions];
-  const balances = new Map(accounts.map((account) => [id(account._id), 0]));
-  for (const item of openingBalances) balances.set(id(item.rekening_id), (balances.get(id(item.rekening_id)) || 0) + Number(item.nilai || 0));
+  const balances = new Map(accounts
+    .map((account) => id(account._id))
+    .filter((accountId) => mongoose.isValidObjectId(accountId))
+    .map((accountId) => [accountId, 0]));
+  for (const item of openingBalances) {
+    const rekeningId = id(item.rekening_id);
+    if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
+    balances.set(rekeningId, balances.get(rekeningId) + Number(item.nilai || 0));
+  }
   for (const item of transactions) {
     if (item.bentukTransaksi === 'MUTASI_REKENING') {
+      const rekeningId = id(item.rekeningId);
+      if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
       const sign = item.arahDana === 'MASUK' ? 1 : -1;
-      balances.set(id(item.rekeningId), (balances.get(id(item.rekeningId)) || 0) + (sign * Number(item.amount || 0)));
+      balances.set(rekeningId, balances.get(rekeningId) + (sign * Number(item.amount || 0)));
       continue;
     }
-    balances.set(id(item.sourceAccountId), (balances.get(id(item.sourceAccountId)) || 0) - Number(item.amount || 0));
-    balances.set(id(item.destinationAccountId), (balances.get(id(item.destinationAccountId)) || 0) + Number(item.amount || 0));
+    const sourceAccountId = id(item.sourceAccountId);
+    const destinationAccountId = id(item.destinationAccountId);
+    if (mongoose.isValidObjectId(sourceAccountId) && balances.has(sourceAccountId)) {
+      balances.set(sourceAccountId, balances.get(sourceAccountId) - Number(item.amount || 0));
+    }
+    if (mongoose.isValidObjectId(destinationAccountId) && balances.has(destinationAccountId)) {
+      balances.set(destinationAccountId, balances.get(destinationAccountId) + Number(item.amount || 0));
+    }
   }
-  for (const [accountId, balance] of balances) await Account.updateOne({ _id: accountId }, { $set: { saldo_akhir: balance } });
+  for (const [accountId, balance] of balances) {
+    if (!mongoose.isValidObjectId(accountId)) continue;
+    await Account.updateOne({ _id: accountId }, { $set: { saldo_akhir: balance } });
+  }
 }
 
 async function migrateLegacyMasterData() {
@@ -1533,6 +1596,10 @@ function sourceDate(value, fallback = now()) {
   return Number.isNaN(parsed.getTime()) ? fallback : parsed;
 }
 
+function sourceBusinessDate(value) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit' }).format(sourceDate(value));
+}
+
 function sourceIdOf(item) {
   return String(item._id || item.source_id || item.sourceId || item.no_reff || '').trim();
 }
@@ -1551,7 +1618,7 @@ function sourceDirection(item) {
 }
 
 async function findSourceAccountCandidates(item, branch) {
-  const noRekening = String(item.no_rekening || item.noRekening || '').trim();
+  const noRekening = normalizeNagagoldValue(item.no_rekening || item.noRekening);
   const unit = sourceBusinessUnit(branch);
   if (isCashPayment(item)) {
     return Account.find({
@@ -1560,8 +1627,8 @@ async function findSourceAccountCandidates(item, branch) {
       bentuk_saldo: 'KAS_TUNAI',
     }).sort({ created_at: 1 }).lean();
   }
-  if (!noRekening || noRekening === '-') return [];
-  const kodeBank = String(item.kode_bank || item.kodeBank || '').trim().toUpperCase();
+  if (!noRekening) return [];
+  const kodeBank = normalizeNagagoldValue(item.kode_bank || item.kodeBank).toUpperCase();
   if (kodeBank) {
     const bank = await Bank.findOne({ kode_bank: kodeBank, aktif: true }).select('_id').lean();
     if (!bank) return [];
@@ -1584,8 +1651,8 @@ function mappingContextFor(item, branch) {
     kode_toko: cash ? '*' : String(branch?.kodeToko || '').toUpperCase(),
     unit: sourceBusinessUnit(branch),
     metode_pembayaran: metodePembayaran,
-    kode_bank: cash ? '' : String(item.kode_bank || item.kodeBank || '').trim().toUpperCase(),
-    nomor_rekening: cash ? '' : String(item.no_rekening || item.noRekening || '').trim(),
+    kode_bank: cash ? '' : normalizeNagagoldValue(item.kode_bank || item.kodeBank).toUpperCase(),
+    nomor_rekening: cash ? '' : normalizeNagagoldValue(item.no_rekening || item.noRekening),
   };
 }
 
@@ -1683,9 +1750,9 @@ function buildNagagoldSourceSnapshot(item, branch) {
     sourceRequestId: sourceRequestIdOf(item),
     sourceNoReff: String(item.no_reff || item.source_no_reff || '').trim(),
     sourceTanggal: String(item.tanggal || sourceDate(item.input_date).toISOString().slice(0, 10)).slice(0, 10),
-    sourceNoRekening: String(item.no_rekening || item.noRekening || '').trim(),
-    sourceKodeBank: String(item.kode_bank || item.kodeBank || '').trim().toUpperCase(),
-    sourceNamaBank: String(item.nama_bank || item.namaBank || '').trim(),
+    sourceNoRekening: normalizeNagagoldValue(item.no_rekening || item.noRekening),
+    sourceKodeBank: normalizeNagagoldValue(item.kode_bank || item.kodeBank).toUpperCase(),
+    sourceNamaBank: normalizeNagagoldValue(item.nama_bank || item.namaBank),
     sourceAmountIn: Number(item.jumlah_in || item.amount_in || item.nilai_masuk_rp || 0),
     sourceAmountOut: Number(item.jumlah_out || item.amount_out || item.nilai_keluar_rp || 0),
     jenisSumber: String(item.jenis || item.jenis_sumber || '').toUpperCase(),
@@ -1884,20 +1951,26 @@ function getNagagoldDecryptionKey(branch) {
   return String(process.env.NAGAGOLD_DECRYPTION_KEY || '').trim();
 }
 
-function sourceCursorQuery(from, to, afterCursor = null) {
-  if (!afterCursor?.date) return { input_date: { $gte: from, $lte: to } };
+function sourceCursorQuery(from, to, afterCursor = null, { includeBusinessDate = false } = {}) {
+  const businessDateClause = includeBusinessDate ? { tanggal: { $gte: sourceBusinessDate(from), $lte: sourceBusinessDate(to) } } : null;
+  if (!afterCursor?.date) {
+    const clauses = [{ input_date: { $gte: from, $lte: to } }];
+    if (businessDateClause) clauses.push(businessDateClause);
+    return clauses.length === 1 ? clauses[0] : { $or: clauses };
+  }
   const cursorDate = new Date(afterCursor.date);
-  if (Number.isNaN(cursorDate.getTime())) return { input_date: { $gte: from, $lte: to } };
+  if (Number.isNaN(cursorDate.getTime())) return sourceCursorQuery(from, to, null, { includeBusinessDate });
   const cursorObjectId = mongoose.isValidObjectId(afterCursor.id) ? new mongoose.Types.ObjectId(afterCursor.id) : null;
   const clauses = [{ input_date: { $gt: cursorDate, $lte: to } }];
   if (cursorObjectId) clauses.push({ input_date: cursorDate, _id: { $gt: cursorObjectId } });
+  if (businessDateClause) clauses.push(businessDateClause);
   return { $or: clauses };
 }
 
-async function readNagagoldDirectly(branch, from, to, afterCursor = null) {
+async function readNagagoldDirectly(branch, from, to, afterCursor = null, options = {}) {
   const connection = await mongoose.createConnection(branch.mongodbUri, { dbName: branch.databaseName || undefined, serverSelectionTimeoutMS: 10000, maxPoolSize: 2 }).asPromise();
   try {
-    const documents = await connection.db.collection(NAGAGOLD_COLLECTION).find(sourceCursorQuery(from, to, afterCursor)).sort({ input_date: 1, _id: 1 }).limit(Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000)).toArray();
+    const documents = await connection.db.collection(NAGAGOLD_COLLECTION).find(sourceCursorQuery(from, to, afterCursor, options)).sort({ input_date: 1, _id: 1 }).limit(Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000)).toArray();
     const key = String(branch.encryptionMode) === '0' ? '' : getNagagoldDecryptionKey(branch);
     return documents.map((document) => decryptNagagoldValue(document, key));
   } finally {
@@ -2157,19 +2230,21 @@ async function fetchNagagoldBranch(branch) {
     const configuredInitialFrom = process.env.NAGAGOLD_SYNC_INITIAL_FROM ? sourceDate(process.env.NAGAGOLD_SYNC_INITIAL_FROM, new Date(Date.now() - initialMinutes * 60 * 1000)) : new Date(Date.now() - initialMinutes * 60 * 1000);
     const limit = Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000);
     const importedExists = Boolean(await SyncTransaction.exists({ isImported: true, kodeToko: branch.kodeToko }));
-    const initialSync = state.initialSyncCompleted !== true;
-    // Jika state lama pernah menjalankan fetch kosong sampai cursor maju ke
-    // sekarang, tetapi belum ada satu pun transaksi Finance, mulai ulang dari
-    // NAGAGOLD_SYNC_INITIAL_FROM. Ini memperbaiki initial backfill tanpa
-    // menghapus data atau mengubah saldo.
-    const resetInitialCursor = initialSync && !importedExists && Number(state.lastFetchedCount || 0) === 0;
+    // Jika seluruh dokumen sinkronisasi hasil uji dihapus, cursor lama tidak
+    // boleh membuat worker melewati transaksi sumber. Reset hanya ketika
+    // sebelumnya memang pernah mengambil data; state kosong tanpa data sumber
+    // tetap tidak dipaksa fetch berulang tanpa batas.
+    const resetInitialCursor = !importedExists && (
+      state.initialSyncCompleted !== true || Number(state.lastFetchedCount || 0) > 0
+    );
+    const initialSync = state.initialSyncCompleted !== true || resetInitialCursor;
     const afterCursor = initialSync && !resetInitialCursor && state.cursorInputDate
       ? { date: state.cursorInputDate, id: state.cursorSourceId }
       : null;
     const cursorDate = initialSync
       ? (afterCursor?.date ? new Date(afterCursor.date) : configuredInitialFrom)
       : computeSyncWindowStart(state.cursorInputDate, rollingDate, lookbackMinutes, configuredInitialFrom);
-    const items = branch.mongodbUri ? await readNagagoldDirectly(branch, cursorDate, until, afterCursor) : await readNagagoldFromEndpoint(branch, cursorDate, until);
+    const items = branch.mongodbUri ? await readNagagoldDirectly(branch, cursorDate, until, afterCursor, { includeBusinessDate: resetInitialCursor }) : await readNagagoldFromEndpoint(branch, cursorDate, until);
     const result = await ingestNagagoldItems(branch, items);
     const reprocessed = await reprocessNagagoldTransactions(branch);
     const latestItem = items[items.length - 1] || null;

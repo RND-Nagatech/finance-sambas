@@ -10,7 +10,7 @@ export const SYNC_STATUSES = Object.freeze({
   NOT_APPLICABLE: 'TIDAK_BERLAKU',
   RECORDED: 'TERCATAT',
   RECONCILED: 'DIREKONSILIASI',
-  NEEDS_REVIEW: 'PERLU_REVIEW',
+  NEEDS_REVIEW: 'PERLU_DIPERIKSA',
   MAPPING_FAILED: 'GAGAL_MAPPING',
   FAILED: 'GAGAL_SINKRONISASI',
 });
@@ -74,6 +74,7 @@ export function inferApprovalStatus(transaction = {}) {
 
 export function inferSyncStatus(transaction = {}) {
   if (!transaction.isImported && !String(transaction.sourceSystem || '').trim()) return SYNC_STATUSES.NOT_APPLICABLE;
+  if (transaction.sync_status === 'PERLU_REVIEW') return SYNC_STATUSES.NEEDS_REVIEW;
   if (transaction.sync_status && values(SYNC_STATUSES).includes(transaction.sync_status)) return transaction.sync_status;
   if (transaction.mappingStatus === 'PERLU_PEMETAAN' || !transaction.rekeningId) return SYNC_STATUSES.MAPPING_FAILED;
   if (transaction.status === 'APPROVED' || transaction.status === 'REJECTED' || transaction.validasiAdminPada) return SYNC_STATUSES.RECONCILED;
@@ -114,9 +115,10 @@ export function syncStatusLabel(value) {
     [SYNC_STATUSES.NOT_APPLICABLE]: 'Tidak berlaku',
     [SYNC_STATUSES.RECORDED]: 'Tercatat',
     [SYNC_STATUSES.RECONCILED]: 'Direkonsiliasi',
-    [SYNC_STATUSES.NEEDS_REVIEW]: 'Perlu review',
+    [SYNC_STATUSES.NEEDS_REVIEW]: 'Perlu diperiksa',
     [SYNC_STATUSES.MAPPING_FAILED]: 'Gagal mapping',
     [SYNC_STATUSES.FAILED]: 'Gagal sinkronisasi',
+    PERLU_REVIEW: 'Perlu diperiksa',
   }[value] || value || '-';
 }
 
@@ -134,7 +136,7 @@ export function journalStatusLabel(value) {
   return {
     [JOURNAL_STATUSES.NOT_CREATED]: 'Belum dibuat',
     [JOURNAL_STATUSES.PROVISIONAL]: 'Provisional',
-    [JOURNAL_STATUSES.POSTED]: 'Posted',
+    [JOURNAL_STATUSES.POSTED]: 'Tercatat',
     [JOURNAL_STATUSES.REVERSED]: 'Reversed',
   }[value] || value || '-';
 }

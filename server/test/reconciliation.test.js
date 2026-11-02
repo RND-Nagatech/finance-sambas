@@ -6,12 +6,15 @@ import {
   candidateIsUseful,
   isCashPayment,
   isNagagoldInternalTransfer,
+  normalizeNagagoldValue,
   reconciliationApplicable,
   sourcePaymentMethod,
 } from '../reconciliation.js';
 
 test('CASH tidak membutuhkan nomor rekening bank', () => {
   assert.equal(isCashPayment({ jenis: 'CASH', no_rekening: '-' }), true);
+  assert.equal(isCashPayment({ jenis: 'TRANSFER', no_rekening: 'false', kode_bank: 'false' }), true);
+  assert.equal(normalizeNagagoldValue('false'), '');
   assert.equal(sourcePaymentMethod({ jenis: 'CASH', no_rekening: '-' }), 'CASH');
   assert.equal(isCashPayment({ jenis: 'TRANSFER', no_rekening: '123', kode_bank: 'BCA' }), false);
 });

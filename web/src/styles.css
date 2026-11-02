@@ -890,6 +890,12 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .modal-card { border-radius:4px; }
 .modal-heading h2, .drawer-heading h2 { font-size:18px; font-weight:600; }
 .form-field input, .form-field select, .form-field textarea { min-height:34px; padding:6px 10px; font-size:12px; }
+.date-range-filter { display:grid; grid-template-columns:repeat(2,minmax(180px,260px)); gap:14px; padding:18px 20px 0; }
+.table-panel > .date-range-filter { padding-bottom:18px; }
+.date-range-filter .filter-field input { width:100%; min-height:42px; box-sizing:border-box; padding:0 12px; border:1px solid #dbe2e7; border-radius:4px; outline:0; color:#4e5c68; background:#fff; font:inherit; font-size:11px; }
+.date-range-filter .filter-field input:focus { border-color:#83b5d5; box-shadow:0 0 0 3px rgba(47,127,184,.12); }
+.status-pending { border-color:#ecd59d; color:#9a6b16; background:#fff8e9; }
+.status-neutral { border-color:#d5dbe0; color:#5e6c76; background:#f1f3f4; }
 @media (max-width:1100px) { .topbar { left:220px; } .page-content { padding-right:24px; padding-left:24px; } }
 @media (max-width:760px) {
   .sidebar { top:0; }
@@ -898,6 +904,7 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
   .workspace { margin-left:0; padding-top:58px; }
   .page-content { padding:20px 16px 30px; }
   .table-search { width:100%; }
+  .date-range-filter { grid-template-columns:1fr; padding:15px; }
 }
 
 /* Disabled request actions must remain visibly unavailable in every table skin. */
@@ -1396,6 +1403,7 @@ tbody tr:hover { background:#f7f9fa; }
 @keyframes toast-progress { from { transform:scaleX(1); } to { transform:scaleX(0); } }
 .login-error { display:flex; align-items:center; gap:8px; }
 .button-spinner { display:inline-block; width:14px; height:14px; flex:0 0 14px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:button-spin .7s linear infinite; }
+.spin { animation:button-spin .7s linear infinite; }
 @keyframes button-spin { to { transform:rotate(360deg); } }
 .button[aria-busy='true'] { cursor:wait; }
 .button[aria-busy='true'] .button-spinner { color:currentColor; }

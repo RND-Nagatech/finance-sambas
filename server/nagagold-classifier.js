@@ -26,7 +26,7 @@ export function isNagagoldOpeningBalance(transaction = {}) {
 export function nagagoldClassificationLabel(value) {
   return {
     [NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE]: 'Siap dibukukan',
-    [NAGAGOLD_CLASSIFICATION_STATUSES.REVIEW_REQUIRED]: 'Perlu review Admin',
+    [NAGAGOLD_CLASSIFICATION_STATUSES.REVIEW_REQUIRED]: 'Perlu diperiksa',
     [NAGAGOLD_CLASSIFICATION_STATUSES.RECONCILIATION_REQUIRED]: 'Perlu rekonsiliasi',
     [NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED]: 'Ditahan',
   }[value] || value || 'Belum diklasifikasikan';

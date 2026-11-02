@@ -16,11 +16,17 @@ export const MATCH_METHODS = Object.freeze({
 
 const values = (object) => Object.values(object);
 
+export function normalizeNagagoldValue(value) {
+  const normalized = String(value ?? '').trim();
+  if (!normalized || ['FALSE', 'NULL', 'UNDEFINED', '-'].includes(normalized.toUpperCase())) return '';
+  return normalized;
+}
+
 export function isCashPayment(item = {}) {
   const paymentValues = [item.jenis, item.type_trx, item.paymentMethod, item.metodePembayaran, item.source_payment_method]
     .map((value) => String(value || '').trim().toUpperCase());
-  const noRekening = String(item.no_rekening || item.noRekening || item.sourceNoRekening || '').trim();
-  return paymentValues.includes('CASH') || paymentValues.includes('TUNAI') || noRekening === '-';
+  const noRekening = normalizeNagagoldValue(item.no_rekening || item.noRekening || item.sourceNoRekening);
+  return paymentValues.includes('CASH') || paymentValues.includes('TUNAI') || !noRekening;
 }
 
 export function sourcePaymentMethod(item = {}) {
