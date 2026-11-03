@@ -29,5 +29,7 @@ export function publicUser(user) {
     username: user?.username || '',
     name: user?.nama_user || user?.name || '',
     role: user?.role || '',
+    active: user?.aktif !== false,
+    lastLogin: user?.terakhir_login || null,
   };
 }

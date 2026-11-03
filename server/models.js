@@ -12,6 +12,43 @@ import { RECONCILIATION_STATUSES } from './reconciliation.js';
 const { Schema } = mongoose;
 const collectionName = (name) => name;
 
+const systemProfileSchema = new Schema({
+  _id: { type: String, default: 'SYSTEM' },
+  tgl_system: { type: String, required: true, trim: true },
+  kode_toko: { type: String, default: 'FINANCE', trim: true, uppercase: true },
+  nama_toko: { type: String, default: 'Finance Sambas', trim: true },
+  no_telp: { type: String, default: '', trim: true },
+  alamat: { type: String, default: '', trim: true },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: collectionName('tp_system'), versionKey: false });
+
+const systemLogSchema = new Schema({
+  type: { type: String, required: true, trim: true, uppercase: true },
+  user: { type: String, required: true, trim: true, lowercase: true },
+  waktu: { type: Date, required: true, default: Date.now },
+  tanggal_dari: { type: String, required: true, trim: true },
+  tanggal_sampai: { type: String, required: true, trim: true },
+  keterangan: { type: String, default: '', trim: true },
+  hasil: { type: Schema.Types.Mixed, default: null },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: collectionName('logs'), versionKey: false });
+systemLogSchema.index({ type: 1, waktu: -1 }, { name: 'idx_logs_type_waktu' });
+
+const balanceSnapshotSchema = new Schema({
+  tanggal_tutup: { type: String, required: true, trim: true },
+  rekening_id: { type: String, required: true, trim: true },
+  saldo_akhir: { type: Number, required: true, default: 0 },
+  total_debet: { type: Number, required: true, default: 0 },
+  total_kredit: { type: Number, required: true, default: 0 },
+  status: { type: String, enum: ['VALID', 'PERLU_HITUNG_ULANG', 'MENGHITUNG', 'GAGAL'], default: 'VALID' },
+  ditutup_oleh: { type: String, default: '', trim: true, lowercase: true },
+  ditutup_pada: { type: Date, default: null },
+  dihitung_pada: { type: Date, default: null },
+  versi: { type: Number, default: 1 },
+  catatan: { type: String, default: '', trim: true },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: collectionName('tt_saldo_snapshot'), versionKey: false });
+balanceSnapshotSchema.index({ rekening_id: 1, tanggal_tutup: -1 }, { name: 'idx_snapshot_rekening_tanggal' });
+balanceSnapshotSchema.index({ tanggal_tutup: 1, status: 1 }, { name: 'idx_snapshot_tanggal_status' });
+balanceSnapshotSchema.index({ rekening_id: 1, tanggal_tutup: 1 }, { unique: true, name: 'uniq_snapshot_rekening_tanggal' });
+
 export const ACCOUNT_KINDS = Object.freeze({
   STORE_CASH: 'KAS_TUNAI_TOKO',
   CASH_ACCOUNT: 'KAS_TUNAI',
@@ -303,9 +340,10 @@ const journalSchema = new Schema({
   no_keuangan: { type: String, required: true },
   no_transaksi: { type: String, default: '' },
   tanggal: { type: String, required: true },
-  tipe: { type: String, enum: ['SALDO_AWAL', 'MUTASI', 'PENJUALAN', 'PEMBELIAN', 'OPERASIONAL', 'TRANSAKSI', 'PEMBALIKAN'], required: true },
+  tipe: { type: String, enum: ['SALDO_AWAL', 'PENYESUAIAN_SALDO', 'MUTASI', 'PENJUALAN', 'PEMBELIAN', 'OPERASIONAL', 'TRANSAKSI', 'PEMBALIKAN'], required: true },
   status: { type: String, enum: ['PROVISIONAL', 'POSTED', 'REVERSED'], default: 'PROVISIONAL' },
   rekening_id: { type: String, required: true },
+  jenis_transaksi: { type: String, default: '', trim: true, uppercase: true },
   no_rekening: { type: String, default: '' },
   kode_bank: { type: String, default: '' },
   nama_rekening: { type: String, default: '' },
@@ -426,11 +464,21 @@ nagagoldAutoPostingSchema.index({ source_system: 1, aktif: 1 });
 const userSchema = new Schema({
   username: { type: String, required: true, unique: true, trim: true, lowercase: true, immutable: true },
   nama_user: { type: String, required: true, trim: true },
-  role: { type: String, enum: ['SUPER_USER', 'ADMIN', 'OWNER'], required: true },
+  role: { type: String, enum: ['SUPER_USER', 'ADMIN', 'OWNER', 'USER'], required: true },
   password_hash: { type: String, required: true },
   aktif: { type: Boolean, default: true },
   terakhir_login: { type: Date, default: null },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: collectionName('tm_user'), versionKey: false });
+
+// Hak menu disimpan per level user, bukan per user. Dengan begitu perubahan
+// akses berlaku konsisten untuk seluruh user pada level yang sama.
+const userAccessSchema = new Schema({
+  level: { type: String, enum: ['SUPER_USER', 'ADMIN', 'OWNER', 'USER'], required: true, unique: true, trim: true, uppercase: true },
+  menu_ids: { type: [String], default: [] },
+  versi_menu: { type: Number, default: 2 },
+  updated_by: { type: String, default: '', trim: true, lowercase: true },
+}, { timestamps: { createdAt: 'dibuat_pada', updatedAt: 'diubah_pada' }, collection: collectionName('tm_hak_akses'), versionKey: false });
+userAccessSchema.index({ level: 1 }, { unique: true, name: 'uniq_hak_akses_level' });
 
 export const Account = mongoose.model('FinanceCashAccount', accountSchema);
 export const Bank = mongoose.model('FinanceBank', bankSchema);
@@ -441,6 +489,7 @@ export const TransactionType = mongoose.model('FinanceTransactionType', transact
 export const Branch = mongoose.model('FinanceBranch', branchSchema);
 export const OpeningBalance = mongoose.model('FinanceOpeningBalance', openingBalanceSchema);
 export const TransferRequest = mongoose.model('FinanceTransferRequest', requestSchema);
+export const UserAccess = mongoose.model('FinanceUserAccess', userAccessSchema);
 // Data yang dibuat langsung di Finance adalah mutasi kas/rekening. Jangan
 // memakai schema transaksi sinkronisasi untuk collection ini: field sumber,
 // mapping, snapshot, dan klasifikasi Nagagold tidak relevan untuk mutasi
@@ -772,6 +821,9 @@ syncSchema.index({ status: 1, tanggal: -1 });
 syncSchema.index({ rekening_id: 1, tanggal: -1 });
 export const FinanceMutation = mongoose.model('FinanceMutation', mutationSchema);
 export const SyncTransaction = mongoose.model('FinanceSyncTransaction', syncSchema);
+export const SystemProfile = mongoose.model('FinanceSystemProfile', systemProfileSchema);
+export const SystemLog = mongoose.model('FinanceSystemLog', systemLogSchema);
+export const BalanceSnapshot = mongoose.model('FinanceBalanceSnapshot', balanceSnapshotSchema);
 // Alias sementara untuk modul lama dan pengujian yang masih memakai nama
 // FinanceTransaction. Dokumen baru tetap masuk ke tt_mutasi.
 export const FinanceTransaction = FinanceMutation;

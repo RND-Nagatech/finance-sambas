@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { Account, BusinessType, CashType, FinanceMutation, JournalEntry, OpeningBalance, SyncState, SyncTransaction, TransferRequest } from './models.js';
+import { Account, BalanceSnapshot, BusinessType, CashType, FinanceMutation, JournalEntry, OpeningBalance, SyncState, SyncTransaction, TransferRequest } from './models.js';
 import { ACCOUNT_KINDS } from './models.js';
 import { isCashPayment, isNagagoldInternalTransfer } from './reconciliation.js';
 
@@ -689,7 +689,8 @@ function journalType(journal = {}) {
 
 export function classifyFinancialEntry(journal = {}, transaction = {}) {
   const type = journalType(journal);
-  const raw = String(transaction.kategoriSumber || transaction.kategori_sistem || transaction.jenisTransaksi || transaction.jenisRequest || journal.kategori || journal.kategori_sistem || '').trim().toUpperCase();
+  const selectedTransactionType = String(journal.jenis_transaksi || journal.jenisTransaksi || transaction.jenisTransaksi || transaction.jenisRequest || '').trim().toUpperCase();
+  const raw = String(transaction.kategoriSumber || transaction.kategori_sistem || selectedTransactionType || journal.kategori || journal.kategori_sistem || '').trim().toUpperCase();
   const debit = Number(journal.debet || 0);
   const credit = Number(journal.kredit || 0);
   const internal = type === 'MUTASI'
@@ -699,6 +700,12 @@ export function classifyFinancialEntry(journal = {}, transaction = {}) {
     || raw.includes('MUTASI');
 
   if (type === 'SALDO_AWAL' || raw.includes('SALDO_AWAL') || raw === 'SALDO AWAL') return { code: 'SALDO_AWAL', label: 'SALDO AWAL' };
+  if (type === 'PENYESUAIAN_SALDO' && selectedTransactionType) {
+    if (selectedTransactionType.includes('PENJUAL') || selectedTransactionType.includes('PENDAPATAN') || selectedTransactionType.includes('PENERIMAAN')) return { code: 'PENERIMAAN', label: 'PENERIMAAN' };
+    if (selectedTransactionType.includes('PEMBELI') || selectedTransactionType.includes('PEMBAYARAN') || selectedTransactionType.includes('OPERASIONAL') || selectedTransactionType.includes('PENGELUARAN') || selectedTransactionType.includes('SERVICE') || selectedTransactionType.includes('SERVIS')) return { code: 'PENGELUARAN', label: 'PENGELUARAN' };
+    return { code: selectedTransactionType, label: selectedTransactionType.replaceAll('_', ' ') };
+  }
+  if (type === 'PENYESUAIAN_SALDO') return { code: 'PENYESUAIAN_SALDO', label: 'PENYESUAIAN SALDO' };
   if (type === 'PEMBALIKAN' || raw.includes('PEMBALIKAN') || raw.includes('REVERSAL')) return { code: 'KOREKSI', label: 'KOREKSI' };
   if (internal) return debit > 0 ? { code: 'MUTASI_MASUK', label: 'MUTASI MASUK' } : { code: 'MUTASI_KELUAR', label: 'MUTASI KELUAR' };
 
@@ -739,6 +746,7 @@ function financialRowFromEntry(journal, transaction, opening, account) {
     journalStatus: journal.status || '',
     date: journalDate(journal),
     transactionNumber,
+    transactionType: journal.jenis_transaksi || transaction?.jenisTransaksi || type,
     eventNumber: transaction?.transactionNumber || journal.no_transaksi || journal.no_keuangan || journal.no_jurnal,
     category: classification.label,
     categoryCode: classification.code,
@@ -878,6 +886,7 @@ function buildFinancialGroupTree(groups, accountRows, selectedGroupId = '', incl
     // memakai seluruh descendants di sini akan membuat mutasi anak ikut
     // terhitung lagi pada kelompok induk.
     const directRows = accountRows.filter((row) => row.cashGroupId === groupId);
+    if (!directRows.length && !childGroups.length) return null;
     const stats = sumFinancialStats(directRows.map(financialGroupStats));
     return { ...stats, id: `group-${groupId}`, rowType: 'GROUP', groupId, parentId: String(group.parent_id || ''), code: group.kode_jenis || '', label: group.nama_jenis || group.kode_jenis || '-', level, children: childGroups, accounts: directAccounts };
   };
@@ -964,15 +973,40 @@ export async function reportFinancial(input = {}) {
     return true;
   });
   const accountIds = accounts.map((account) => String(account._id));
+  const useSnapshots = status === 'POSTED' && !filters.sourceType;
+  const snapshotByAccount = new Map();
+  if (useSnapshots && accountIds.length && filters.dateFrom) {
+    const snapshots = await BalanceSnapshot.find({ rekening_id: { $in: accountIds }, tanggal_tutup: { $lt: filters.dateFrom } })
+      .sort({ rekening_id: 1, tanggal_tutup: -1 })
+      .lean();
+    for (const snapshot of snapshots) {
+      const accountId = String(snapshot.rekening_id);
+      if (!snapshotByAccount.has(accountId)) snapshotByAccount.set(accountId, snapshot);
+    }
+    for (const [accountId, snapshot] of snapshotByAccount) {
+      if (snapshot.status !== 'VALID') snapshotByAccount.delete(accountId);
+    }
+  }
+  const snapshotAccountIds = [...snapshotByAccount.keys()];
+  const unsnapshottedAccountIds = accountIds.filter((accountId) => !snapshotByAccount.has(accountId));
+  const journalScopes = [];
+  if (snapshotAccountIds.length) {
+    const earliestSnapshot = [...snapshotByAccount.values()].map((snapshot) => snapshot.tanggal_tutup).sort()[0];
+    journalScopes.push({ rekening_id: { $in: snapshotAccountIds }, tanggal: { $gt: earliestSnapshot, $lte: filters.dateTo } });
+  }
+  if (unsnapshottedAccountIds.length) journalScopes.push({ rekening_id: { $in: unsnapshottedAccountIds }, tanggal: { $lte: filters.dateTo } });
   const journalQuery = {
     ...journalStatusQuery,
-    tanggal: { $lte: filters.dateTo },
-    rekening_id: { $in: accountIds },
+    ...(journalScopes.length ? { $or: journalScopes } : { rekening_id: { $in: accountIds }, tanggal: { $lte: filters.dateTo } }),
   };
   // Saldo berjalan dan saldo awal harus dihitung dari seluruh jurnal sampai
   // tanggal akhir. Pagination baru diterapkan setelah saldo per rekening
   // selesai dihitung, supaya halaman kedua tidak memulai saldo dari nol.
-  const journals = accountIds.length ? await JournalEntry.find(journalQuery).sort({ tanggal: 1, dibuat_pada: 1, _id: 1 }).lean() : [];
+  const loadedJournals = accountIds.length ? await JournalEntry.find(journalQuery).sort({ tanggal: 1, dibuat_pada: 1, _id: 1 }).lean() : [];
+  const journals = loadedJournals.filter((journal) => {
+    const snapshot = snapshotByAccount.get(String(journal.rekening_id));
+    return !snapshot || String(journal.tanggal) > String(snapshot.tanggal_tutup);
+  });
   const transactionNumbers = [...new Set(journals.map((journal) => String(journal.no_transaksi || '').trim()).filter(Boolean))];
   const openingJournalNumbers = journals.filter((journal) => journalType(journal) === 'SALDO_AWAL').map((journal) => String(journal.no_keuangan || journal.no_jurnal));
   const [transactions, openings] = await Promise.all([
@@ -1009,10 +1043,12 @@ export async function reportFinancial(input = {}) {
     const before = accountHistory.filter((row) => row.date < filters.dateFrom);
     const period = accountHistory.filter((row) => row.date >= filters.dateFrom && row.date <= filters.dateTo);
     const stats = emptyFinancialStats();
-    for (const row of before) addFinancialEntry(stats, row, { opening: true });
+    const snapshot = snapshotByAccount.get(accountId);
+    stats.saldoAwal = Number(snapshot?.saldo_akhir || 0);
+    for (const row of before) stats.saldoAwal += row.effect;
     for (const row of period) addFinancialEntry(stats, row);
     const publicStats = publicFinancialStats(stats);
-    const saldoSebelumPeriode = before.reduce((sum, row) => sum + row.effect, 0);
+    const saldoSebelumPeriode = Number(snapshot?.saldo_akhir || 0) + before.reduce((sum, row) => sum + row.effect, 0);
     return {
       ...publicStats,
       _eventKeys: stats._eventKeys,
@@ -1030,8 +1066,9 @@ export async function reportFinancial(input = {}) {
       kodeToko: account.kode_toko || '',
       bankCode: account.bentuk_saldo === 'KAS_TUNAI' ? 'TUNAI' : details.bankCode || '',
       hasTransactions: accountHistory.length > 0,
+      hasPeriodTransactions: period.length > 0,
     };
-  }).filter((row) => filters.includeEmptyAccounts || row.hasTransactions);
+  }).filter((row) => filters.includeEmptyAccounts || row.hasPeriodTransactions);
   const accountRowMap = new Map(accountRows.map((row) => [row.accountId, row]));
   const periodEntries = sourceFilteredEntries.filter((row) => row.date >= filters.dateFrom && row.date <= filters.dateTo);
   const runningByAccount = new Map(accountRows.map((row) => [row.accountId, row.saldoSebelumPeriode || 0]));
@@ -1061,6 +1098,7 @@ export async function reportFinancial(input = {}) {
   const summary = { ...totalStats, status: status || 'POSTED', periodeAwal: filters.dateFrom, periodeAkhir: filters.dateTo, rekeningCount: accountRows.length, unclassifiedCount: totalStats.unclassifiedCount };
   return {
     filters: { ...filters, journalStatus: status, saldoAwalProvisional: status === 'POSTED' },
+    snapshot: { digunakan: useSnapshots && snapshotByAccount.size > 0, rekening: snapshotByAccount.size },
     view: filters.view,
     groupBy: filters.groupBy,
     page: filters.page,
