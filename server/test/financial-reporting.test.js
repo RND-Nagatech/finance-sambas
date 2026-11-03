@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyFinancialEntry, normalizeReportFilters } from '../reporting.js';
+import { classifyFinancialEntry, financialSource, normalizeReportFilters } from '../reporting.js';
 
 test('laporan keuangan mengklasifikasikan saldo awal berdasarkan tipe jurnal', () => {
   assert.deepEqual(
@@ -38,4 +38,11 @@ test('filter laporan keuangan default ke POSTED dan mempertahankan tanggal bisni
   assert.equal(filters.groupBy, 'CASH_GROUP');
   assert.equal(filters.view, 'summary');
   assert.equal(filters.includeEmptyAccounts, false);
+});
+
+test('laporan keuangan membedakan transaksi sumber OPTIK dan NAGAGOLD', () => {
+  assert.equal(financialSource({ isImported: true, sumber: 'OPTIK' }), 'OPTIK');
+  assert.equal(financialSource({ isImported: true, source_type: 'SYNC_OPTIK' }), 'OPTIK');
+  assert.equal(financialSource({ isImported: true, sumber: 'NAGAGOLD' }), 'NAGAGOLD');
+  assert.equal(financialSource({ source_type: 'MANUAL_ADMIN' }), 'FINANCE');
 });

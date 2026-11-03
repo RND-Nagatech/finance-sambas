@@ -131,6 +131,10 @@ const nextRequestNumber = (tanggal, session) => nextSequentialNumber('RQS', tang
 const nextManualTransactionNumber = (tanggal, session) => nextSequentialNumber('TRX', tanggal, session);
 const mask = (value) => value ? `${'•'.repeat(Math.max(0, String(value).length - 4))}${String(value).slice(-4)}` : '';
 const NAGAGOLD_COLLECTION = 'tt_cash_daily';
+const SOURCE_CONFIGS = Object.freeze({
+  NAGAGOLD: Object.freeze({ code: 'NAGAGOLD', key: 'nagagold', collection: NAGAGOLD_COLLECTION, uriEnv: 'NAGAGOLD_MONGODB_URI', keyEnv: 'NAGAGOLD_DECRYPTION_KEY', modeEnv: 'NAGAGOLD_ENCRYPTION_MODE', limitEnv: 'NAGAGOLD_SYNC_LIMIT' }),
+  OPTIK: Object.freeze({ code: 'OPTIK', key: 'optik', collection: NAGAGOLD_COLLECTION, uriEnv: 'OPTIK_MONGODB_URI', keyEnv: 'OPTIK_DECRYPTION_KEY', modeEnv: 'OPTIK_ENCRYPTION_MODE', limitEnv: 'OPTIK_SYNC_LIMIT' }),
+});
 const NAGAGOLD_AUTO_POSTING_ENABLED = String(process.env.NAGAGOLD_AUTO_POSTING_ENABLED || 'false').toLowerCase() === 'true';
 // Transaksi sumber Nagagold sudah divalidasi di toko. Jika mapping rekening
 // Finance unik, transaksi boleh langsung dibukukan tanpa validasi kedua oleh
@@ -141,6 +145,44 @@ const NAGAGOLD_SOURCE_POSTING_ENABLED = String(process.env.NAGAGOLD_SOURCE_POSTI
 const LEGACY_MASTER_MIGRATION_ENABLED = String(process.env.LEGACY_MASTER_MIGRATION_ENABLED || 'false').toLowerCase() === 'true';
 const SNAPSHOT_RECOVERY_CONFIRMATION = 'APPLY_NAGAGOLD_SNAPSHOT_RECOVERY';
 let nagagoldSyncRunning = false;
+
+function sourceConfigForBranch(branch = {}) {
+  const code = String(branch.jenisBisnis || branch.jenis_bisnis || branch.unit || 'NAGAGOLD').trim().toUpperCase();
+  return SOURCE_CONFIGS[code] || SOURCE_CONFIGS.NAGAGOLD;
+}
+
+function sourceConfigForTransaction(transaction = {}) {
+  const code = String(transaction.sumber || transaction.jenis_bisnis || transaction.jenisBisnis || transaction.sourceSystem || 'NAGAGOLD').trim().toUpperCase();
+  return SOURCE_CONFIGS[code] || SOURCE_CONFIGS.NAGAGOLD;
+}
+
+function normalizeSourceBusiness(value, fallback = 'NAGAGOLD') {
+  const normalized = String(value || '').trim().toUpperCase();
+  return SOURCE_CONFIGS[normalized] ? normalized : fallback;
+}
+
+function branchBusinessQuery(jenisBisnis) {
+  const source = normalizeSourceBusiness(jenisBisnis);
+  // Data cabang lama yang belum memiliki jenis bisnis diperlakukan sebagai
+  // Nagagold agar tetap dapat dibaca tanpa membuat identitas Optik ambigu.
+  return source === 'NAGAGOLD'
+    ? { $or: [{ jenis_bisnis: 'NAGAGOLD' }, { jenis_bisnis: { $exists: false } }, { jenis_bisnis: '' }] }
+    : { jenis_bisnis: source };
+}
+
+function branchIdentityQuery({ kodeToko = '', jenisBisnis = '', databaseName = '' } = {}) {
+  const query = { ...branchBusinessQuery(jenisBisnis), kode_toko: String(kodeToko || '').trim().toUpperCase() };
+  if (databaseName) query.database_name = String(databaseName).trim();
+  return query;
+}
+
+function journalSourceForTransaction(transaction = {}) {
+  const explicit = String(transaction.sumber || '').trim().toUpperCase();
+  if (['FINANCE', 'NAGAGOLD', 'OPTIK'].includes(explicit)) return explicit;
+  const sourceType = String(transaction.source_type || transaction.sourceType || '').trim().toUpperCase();
+  if (transaction.isImported || sourceType === 'SYNC' || sourceType === 'SYNC_NAGAGOLD' || sourceType === 'SYNC_OPTIK') return sourceConfigForTransaction(transaction).code;
+  return 'FINANCE';
+}
 
 function systemProfilePayload(raw = {}) {
   return {
@@ -357,9 +399,12 @@ app.post('/api/users/:id/restore', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), 
 async function userAccessPayload() {
   const saved = await UserAccess.find({}).lean();
   const savedByLevel = new Map(saved.map((item) => [String(item.level).toUpperCase(), item]));
+  // Super User adalah akun bawaan program dengan seluruh akses. Level ini
+  // tidak perlu dan tidak boleh dikonfigurasi melalui halaman Manage User.
+  const managedLevels = USER_LEVELS.filter((level) => level.code !== 'SUPER_USER');
   return {
     menuGroups: menuGroupsPayload(),
-    levels: USER_LEVELS.map((level) => ({
+    levels: managedLevels.map((level) => ({
       code: level.code,
       name: level.name,
       menuIds: (() => {
@@ -383,6 +428,7 @@ app.get('/api/user-access', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRo
 
 app.patch('/api/user-access/:level', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
   const level = String(req.params.level || '').trim().toUpperCase();
+  if (level === 'SUPER_USER') throw new HttpError(403, 'Hak akses Super User sudah ditetapkan penuh oleh sistem.');
   if (!USER_LEVELS.some((item) => item.code === level)) throw new HttpError(422, 'Level user tidak valid.');
   if (!Array.isArray(req.body?.menuIds)) throw new HttpError(422, 'Daftar menu harus berupa array.');
   const menuIds = normalizeMenuIds(req.body.menuIds);
@@ -401,9 +447,7 @@ app.post('/api/auth/logout', asyncRoute(async (req, res) => {
 }));
 
 async function getNagagoldBranches() {
-  const branches = await Branch.find({ aktif: { $ne: false }, $or: [{ jenis_bisnis: 'NAGAGOLD' }, { jenis_bisnis: { $exists: false } }, { jenis_bisnis: '' }] }).sort({ kode_toko: 1 }).lean();
-  const mongodbUri = String(process.env.NAGAGOLD_MONGODB_URI || '').trim();
-  if (!mongodbUri) throw new HttpError(500, 'NAGAGOLD_MONGODB_URI belum diisi.');
+  const branches = await Branch.find({ aktif: { $ne: false }, $or: [{ jenis_bisnis: { $in: ['NAGAGOLD', 'OPTIK'] } }, { jenis_bisnis: { $exists: false } }, { jenis_bisnis: '' }] }).sort({ kode_toko: 1 }).lean();
   return branches.map((branch) => ({
     id: id(branch._id),
     kodeToko: branch.kode_toko,
@@ -411,13 +455,18 @@ async function getNagagoldBranches() {
     jenisBisnis: String(branch.jenis_bisnis || 'NAGAGOLD').trim().toUpperCase(),
     portal: branch.portal || '',
     tipeToko: branch.tipe_toko || '',
-    mongodbUri,
+    mongodbUri: String(process.env[SOURCE_CONFIGS[String(branch.jenis_bisnis || 'NAGAGOLD').trim().toUpperCase()]?.uriEnv || 'NAGAGOLD_MONGODB_URI'] || process.env.NAGAGOLD_MONGODB_URI || '').trim(),
     databaseName: branch.database_name,
-  })).filter((branch) => branch.kodeToko && branch.databaseName);
+  })).filter((branch) => {
+    const config = sourceConfigForBranch(branch);
+    if (!branch.kodeToko || !branch.databaseName) return false;
+    if (!branch.mongodbUri) throw new HttpError(500, `${config.code === 'OPTIK' ? 'OPTIK_MONGODB_URI atau NAGAGOLD_MONGODB_URI' : 'NAGAGOLD_MONGODB_URI'} belum diisi.`);
+    return true;
+  });
 }
 
 function sourceBusinessUnit(branch) {
-  return String(branch?.jenisBisnis || branch?.unit || 'NAGAGOLD').trim().toUpperCase();
+  return sourceConfigForBranch(branch).code;
 }
 
 function serializeAccount(item) {
@@ -541,7 +590,7 @@ function integrationStatus(raw = {}, { isImported = Boolean(raw.isImported) } = 
   const reconciliation = raw.reconciliation_status || '';
   const mapping = raw.mappingStatus || '';
   const requestId = String(raw.requestId || '').trim();
-  if (category === 'SALDO AWAL' || category === 'SALDO_AWAL') return { code: 'NOT_PROCESSED', label: 'Tidak diproses', reason: 'Saldo awal Nagagold dicatat melalui menu saldo awal Finance.' };
+  if (category === 'SALDO AWAL' || category === 'SALDO_AWAL') return { code: 'NOT_PROCESSED', label: 'Tidak diproses', reason: 'Saldo awal sumber dicatat melalui menu saldo awal Finance.' };
   if (journalStatus === JOURNAL_STATUSES.POSTED && (saldoStatus === BALANCE_STATUSES.APPLIED || !saldoStatus) || reconciliation === RECONCILIATION_STATUSES.MATCHED) {
     return { code: 'RECORDED', label: 'Tercatat', reason: raw.sync_message || 'Sudah tercatat di saldo Finance.' };
   }
@@ -738,7 +787,7 @@ async function manualJournalAccounts(items) {
 
 function nagagoldTransactionQuery(extra = {}) {
   return {
-    sumber: 'NAGAGOLD',
+    sumber: { $in: ['NAGAGOLD', 'OPTIK'] },
     $and: [
       { kategori: { $ne: 'SALDO AWAL' } },
       extra,
@@ -760,7 +809,9 @@ function serializeNagagoldMapping(item, accountsById = new Map()) {
     sourceSystem: raw.source_system,
     kodeToko: raw.kode_toko,
     unit: raw.unit,
+    jenisBisnis: raw.unit,
     metodePembayaran: raw.metode_pembayaran,
+    jenisPembayaran: raw.metode_pembayaran,
     kodeBank: raw.kode_bank || '',
     nomorRekening: raw.nomor_rekening || '',
     jenisAkun: raw.jenis_akun,
@@ -799,9 +850,10 @@ function normalizeAutoPostingValue(value, fallback = '*') {
 
 function autoPostingContext(transaction) {
   const method = sourcePaymentMethod(transaction);
+  const unit = String(transaction.jenis_bisnis || transaction.jenisBisnis || transaction.sourceSystem || 'NAGAGOLD').trim().toUpperCase() || 'NAGAGOLD';
   return {
     sourceSystem: String(transaction.sourceSystem || 'nagagold').toLowerCase(),
-    unit: 'NAGAGOLD',
+    unit,
     kodeToko: normalizeAutoPostingValue(transaction.kodeToko, ''),
     jenisTransaksi: normalizeAutoPostingValue(transaction.jenisSumber, ''),
     kategoriTransaksi: normalizeAutoPostingValue(transaction.kategoriSumber, ''),
@@ -936,16 +988,25 @@ async function findReversalJournal(transaction, session) {
 
 async function financeEntries(entries, session) {
   const accountIds = [...new Set(entries.map((entry) => id(entry.rekeningId)).filter((value) => mongoose.isValidObjectId(value)))];
-  const accounts = await Account.find({ _id: { $in: accountIds } }).populate({ path: 'bank_id', select: 'kode_bank' }).session(session || null).lean();
+  const accounts = await Account.find({ _id: { $in: accountIds } }).populate({ path: 'bank_id', select: 'kode_bank nama_bank' }).session(session || null).lean();
   const accountMap = new Map(accounts.map((account) => [id(account._id), account]));
   return entries.map((entry) => {
     const rekeningId = id(entry.rekeningId);
     const account = accountMap.get(rekeningId);
+    const bank = account?.bank_id && typeof account.bank_id === 'object' ? account.bank_id : null;
+    const cash = account?.bentuk_saldo === 'KAS_TUNAI';
+    const cabangId = entry.cabang_id || entry.cabangId || account?.cabang_id || null;
     return {
       rekening_id: rekeningId,
       no_rekening: account?.nomor_rekening || account?.kode_akun || '',
-      kode_bank: account?.bank_id?.kode_bank || '',
+      kode_bank: cash ? 'TUNAI' : (bank?.kode_bank || ''),
       nama_rekening: account?.nama_rekening || '',
+      nama_bank: cash ? 'TUNAI' : (bank?.nama_bank || ''),
+      bank_id: bank?._id || account?.bank_id || null,
+      cabang_id: mongoose.isValidObjectId(cabangId) ? cabangId : null,
+      kode_toko: String(entry.kode_toko || entry.kodeToko || account?.kode_toko || '').trim().toUpperCase(),
+      nama_toko: String(entry.nama_toko || entry.namaToko || '').trim(),
+      jenis_bisnis: String(entry.jenis_bisnis || entry.jenisBisnis || account?.unit || '').trim().toUpperCase(),
       debet: Number(entry.debet || 0),
       kredit: Number(entry.kredit || 0),
       detail_faktur: Array.isArray(entry.detail_faktur) ? entry.detail_faktur : [],
@@ -954,13 +1015,33 @@ async function financeEntries(entries, session) {
   });
 }
 
-function financePayload({ noKeuangan, noTransaksi = '', tanggal, tipe, jenisTransaksi = '', status = 'PROVISIONAL', entry, createdBy = 'system', approvedBy = '', approvedAt = null }) {
+function financeAccountSnapshot(account = null) {
+  if (!account) return {
+    no_rekening: '',
+    kode_bank: '',
+    nama_bank: '',
+    nama_rekening: '',
+    bank_id: null,
+  };
+  const bank = account.bank_id && typeof account.bank_id === 'object' ? account.bank_id : null;
+  const cash = account.bentuk_saldo === 'KAS_TUNAI';
+  return {
+    no_rekening: account.nomor_rekening || account.kode_akun || '',
+    kode_bank: cash ? 'TUNAI' : (bank?.kode_bank || ''),
+    nama_bank: cash ? 'TUNAI' : (bank?.nama_bank || ''),
+    nama_rekening: account.nama_rekening || '',
+    bank_id: bank?._id || account.bank_id || null,
+  };
+}
+
+function financePayload({ noKeuangan, noTransaksi = '', tanggal, tipe, jenisTransaksi = '', status = 'PROVISIONAL', sumber = 'FINANCE', entry, createdBy = 'system', approvedBy = '', approvedAt = null }) {
   return {
     no_keuangan: noKeuangan,
     no_transaksi: noTransaksi,
     tanggal,
     tipe,
     status,
+    sumber: ['FINANCE', 'NAGAGOLD', 'OPTIK'].includes(String(sumber || '').trim().toUpperCase()) ? String(sumber).trim().toUpperCase() : 'FINANCE',
     jenis_transaksi: jenisTransaksi || entry?.jenis_transaksi || '',
     ...entry,
     created_by: createdBy,
@@ -983,6 +1064,7 @@ async function createInitialJournal(transaction, session) {
       noTransaksi,
       tanggal: transaction.transactionDate,
       tipe,
+      sumber: 'FINANCE',
       createdBy: transaction.created_by || transaction.createdBy || 'system',
       entry,
     })], { session }));
@@ -1015,11 +1097,24 @@ async function createMutationJournal(transaction, session) {
   const incoming = transaction.arahDana === 'MASUK';
   const accountId = id(transaction.rekeningId);
   const detailFaktur = financeInvoiceNumbers(transaction);
+  const source = sourceConfigForTransaction(transaction);
+  const keterangan = String(transaction.sourceKeterangan || transaction.sourceDeskripsi || transaction.note || '').trim()
+    || `${incoming ? 'Dana masuk' : 'Dana keluar'} dari transaksi ${source.code}`;
   const [entry] = await financeEntries([
-    { rekeningId: accountId, debet: incoming ? transaction.amount : 0, kredit: incoming ? 0 : transaction.amount, detail_faktur: detailFaktur, keterangan: incoming ? 'Dana masuk dari transaksi Nagagold' : 'Dana keluar untuk transaksi Nagagold' },
+    {
+      rekeningId: accountId,
+      debet: incoming ? transaction.amount : 0,
+      kredit: incoming ? 0 : transaction.amount,
+      detail_faktur: detailFaktur,
+      keterangan,
+      cabang_id: transaction.cabang_id,
+      kode_toko: transaction.kodeToko || transaction.kode_toko,
+      nama_toko: transaction.namaTokoSnapshot || transaction.nama_toko,
+      jenis_bisnis: transaction.jenis_bisnis || transaction.jenisBisnis || transaction.sumber,
+    },
   ], session);
   const created = await JournalEntry.create([{
-    ...financePayload({ noKeuangan: await nextFinanceNumber(transaction.transactionDate, session), noTransaksi: transactionNumber(transaction), tanggal: transaction.transactionDate, tipe: financeType(transaction), entry }),
+    ...financePayload({ noKeuangan: await nextFinanceNumber(transaction.transactionDate, session), noTransaksi: transactionNumber(transaction), tanggal: transaction.transactionDate, tipe: financeType(transaction), sumber: journalSourceForTransaction(transaction), entry }),
   }], { session });
   await markBalanceSnapshotsStale(created.map((item) => item.rekening_id), transaction.transactionDate, session);
   return created;
@@ -1039,13 +1134,19 @@ async function ensureReversalJournal(transaction, originalJournal, session, crea
     return existing;
   }
   if (!originalJournal || !['PROVISIONAL', 'POSTED'].includes(originalJournal.status)) return null;
+  const snapshot = {
+    cabang_id: transaction.cabang_id || transaction.cabangId || originalJournal.cabang_id || null,
+    kode_toko: transaction.kodeToko || transaction.kode_toko || originalJournal.kode_toko || '',
+    nama_toko: transaction.namaTokoSnapshot || transaction.nama_toko || originalJournal.nama_toko || '',
+    jenis_bisnis: transaction.jenis_bisnis || transaction.jenisBisnis || originalJournal.jenis_bisnis || '',
+  };
   const entries = transaction.bentukTransaksi === 'MUTASI_REKENING'
     ? [
-      { rekeningId: transaction.rekeningId, debet: transaction.arahDana === 'KELUAR' ? transaction.amount : 0, kredit: transaction.arahDana === 'MASUK' ? transaction.amount : 0, keterangan: 'Pembalikan mutasi rekening' },
+      { rekeningId: transaction.rekeningId, ...snapshot, debet: transaction.arahDana === 'KELUAR' ? transaction.amount : 0, kredit: transaction.arahDana === 'MASUK' ? transaction.amount : 0, keterangan: 'Pembalikan mutasi rekening' },
     ]
     : [
-      { rekeningId: transaction.sourceAccountId, debet: transaction.amount, kredit: 0, keterangan: 'Jurnal balik ke akun sumber' },
-      { rekeningId: transaction.destinationAccountId, debet: 0, kredit: transaction.amount, keterangan: 'Jurnal balik dari akun tujuan' },
+      { rekeningId: transaction.sourceAccountId, ...snapshot, debet: transaction.amount, kredit: 0, keterangan: 'Jurnal balik ke akun sumber' },
+      { rekeningId: transaction.destinationAccountId, ...snapshot, debet: 0, kredit: transaction.amount, keterangan: 'Jurnal balik dari akun tujuan' },
     ];
   const details = await financeEntries(entries, session);
   const created = [];
@@ -1055,6 +1156,7 @@ async function ensureReversalJournal(transaction, originalJournal, session, crea
       noTransaksi: transactionNumber(transaction),
       tanggal: today(),
       tipe: 'PEMBALIKAN',
+      sumber: journalSourceForTransaction(originalJournal),
       createdBy,
       status: 'POSTED',
       entry,
@@ -1072,7 +1174,7 @@ async function ensureOpeningJournal(item, session, createdBy = 'system', status 
     { rekeningId: item.rekening_id, debet: item.nilai, kredit: 0, keterangan: 'Saldo awal rekening' },
   ], session);
   const created = await JournalEntry.create([{
-    ...financePayload({ noKeuangan: await nextFinanceNumber(item.tanggal, session), tanggal: item.tanggal, tipe: 'SALDO_AWAL', createdBy, status, entry }),
+    ...financePayload({ noKeuangan: await nextFinanceNumber(item.tanggal, session), tanggal: item.tanggal, tipe: 'SALDO_AWAL', sumber: 'FINANCE', createdBy, status, entry }),
   }], { session });
   await markBalanceSnapshotsStale(created.map((journal) => journal.rekening_id), item.tanggal, session);
   return created[0];
@@ -1086,7 +1188,7 @@ async function ensureOpeningReversalJournal(item, openingJournal, session, creat
     { rekeningId: item.rekening_id, debet: 0, kredit: item.nilai, keterangan: 'Saldo awal dibalik' },
   ], session);
   const created = await JournalEntry.create([{
-    ...financePayload({ noKeuangan: await nextFinanceNumber(today(), session), tanggal: today(), tipe: 'PEMBALIKAN', createdBy, status: 'POSTED', entry }),
+    ...financePayload({ noKeuangan: await nextFinanceNumber(today(), session), tanggal: today(), tipe: 'PEMBALIKAN', sumber: journalSourceForTransaction(openingJournal), createdBy, status: 'POSTED', entry }),
   }], { session });
   return created[0];
 }
@@ -1118,8 +1220,9 @@ function importedSyncState(item, mappingResult, branch) {
       : 'Rekening sumber belum ditemukan, atau nomor rekening dan bank tidak unik di Master Rekening.');
     return { status: SYNC_STATUSES.MAPPING_FAILED, message: reason };
   }
-  if (String(item.status || '').toUpperCase() !== 'OPEN') return { status: SYNC_STATUSES.NEEDS_REVIEW, message: `Data sumber berstatus ${String(item.status || 'KOSONG').toUpperCase()} dan perlu diperiksa Admin.` };
-  return { status: SYNC_STATUSES.RECORDED, message: 'Data dari sumber sudah tercatat dan menunggu pemeriksaan Admin.' };
+  const finality = sourceFinalityAudit(item, branch);
+  if (finality.status !== 'FINAL_CONFIRMED') return { status: SYNC_STATUSES.NEEDS_REVIEW, message: finality.note };
+  return { status: SYNC_STATUSES.RECORDED, message: 'Data dari sumber sudah tervalidasi dan siap dibukukan ke Finance.' };
 }
 
 function reconciliationMessage(status, count = 0) {
@@ -1368,6 +1471,12 @@ async function postImportedNagagoldTransaction(transactionId) {
     return await withMongoTransaction(async (session) => {
       const current = await SyncTransaction.findOne(nagagoldTransactionQuery({ _id: transactionId })).session(session);
       if (!current) return { posted: false, skipped: true, reason: 'Transaksi sumber tidak ditemukan.' };
+      // Status TERCATAT/TERHUBUNG adalah tanda final pada tt_sinkronisasi.
+      // Jangan pernah mengubah saldo rekening lagi hanya karena worker
+      // membaca ulang transaksi saat restart atau sinkronisasi berikutnya.
+      if (['TERCATAT', 'TERHUBUNG'].includes(String(current.status || '').toUpperCase())) {
+        return { posted: false, skipped: true, idempotent: true };
+      }
       if (current.matched_transaction_id || current.reconciliation_status === RECONCILIATION_STATUSES.MATCHED || String(current.requestId || '').trim()) {
         if (current.matched_transaction_id || current.reconciliation_status === RECONCILIATION_STATUSES.MATCHED) {
           current.approval_status = APPROVAL_STATUSES.NOT_REQUIRED;
@@ -1393,20 +1502,46 @@ async function postImportedNagagoldTransaction(transactionId) {
       );
       if (claim.modifiedCount !== 1) return { posted: false, skipped: true, reason: 'Transaksi sedang diproses oleh worker lain.' };
 
-      const journal = await ensureMutationJournal(current, session);
+      // Jurnal Finance adalah sumber kebenaran. Bila jurnal sudah ada,
+      // proses pemulihan cukup menyelesaikan status transaksi sumber tanpa
+      // mengurangi/menambah saldo rekening untuk kedua kalinya. Dalam satu
+      // transaksi Mongo, jurnal baru selalu dibuat sebelum status sumber
+      // menjadi final, sehingga journalWasExisting menjadi penanda aman untuk
+      // mencegah pengulangan update saldo setelah restart.
+      const existingJournal = await findTransactionJournal(current, session);
+      if (existingJournal?.status === JOURNAL_STATUSES.POSTED) {
+        current.status = 'TERCATAT';
+        current.no_keuangan = existingJournal.no_keuangan || current.no_keuangan;
+        current.statusValid = true;
+        current.approval_status = APPROVAL_STATUSES.NOT_REQUIRED;
+        current.approved_by = current.approved_by || 'system';
+        current.approved_at = current.approved_at || now();
+        current.journal_status = JOURNAL_STATUSES.POSTED;
+        current.saldo_status = BALANCE_STATUSES.APPLIED;
+        current.sync_status = SYNC_STATUSES.RECORDED;
+        await current.save({ session });
+        return { posted: false, skipped: true, idempotent: true, journalId: id(existingJournal._id) };
+      }
+      const journal = existingJournal || (await createMutationJournal(current, session))[0];
       const amount = Number(current.amount || 0);
       // Transaksi Nagagold tetap harus dibukukan walaupun saldo Finance saat
       // ini nol atau menjadi negatif. Saldo aktual mengikuti urutan transaksi;
       // saldo awal yang dicatat belakangan tidak boleh menghilangkan transaksi
       // keluar yang sudah terjadi.
-      const accountQuery = { _id: current.rekeningId, aktif: true };
-      const accountUpdate = await Account.updateOne(accountQuery, { $inc: { saldo_akhir: current.arahDana === 'MASUK' ? amount : -amount } }, { session });
-      if (accountUpdate.modifiedCount !== 1) throw new HttpError(422, `Rekening tidak ditemukan atau tidak aktif untuk ${current.transactionNumber}.`);
+      if (!existingJournal) {
+        const accountQuery = { _id: current.rekeningId, aktif: true };
+        const accountUpdate = await Account.updateOne(accountQuery, { $inc: { saldo_akhir: current.arahDana === 'MASUK' ? amount : -amount } }, { session });
+        if (accountUpdate.modifiedCount !== 1) throw new HttpError(422, `Rekening tidak ditemukan atau tidak aktif untuk ${current.transactionNumber}.`);
+      }
       journal.status = JOURNAL_STATUSES.POSTED;
       journal.approved_by = 'system';
       journal.approved_at = journal.approved_at || now();
       await journal.save({ session });
       current.status = 'TERCATAT';
+      // Nomor KU dibuat sekali untuk tt_keuangan dan disalin pada transaksi
+      // sinkronisasi dalam transaksi Mongo yang sama. Dengan begitu data
+      // sumber tidak pernah berstatus tercatat tetapi kehilangan referensi KU.
+      current.no_keuangan = journal.no_keuangan;
       current.statusValid = true;
       current.approval_status = APPROVAL_STATUSES.NOT_REQUIRED;
       current.approved_by = 'system';
@@ -1414,9 +1549,10 @@ async function postImportedNagagoldTransaction(transactionId) {
       current.journal_status = JOURNAL_STATUSES.POSTED;
       current.saldo_status = BALANCE_STATUSES.APPLIED;
       current.sync_status = SYNC_STATUSES.RECORDED;
-      current.sync_message = 'Transaksi Nagagold sudah tervalidasi di toko, terpetakan, dan dibukukan otomatis ke saldo Finance.';
+      const sourceCode = sourceConfigForTransaction(current).code;
+      current.sync_message = `Transaksi ${sourceCode} sudah tervalidasi di sumber, terpetakan, dan dibukukan otomatis ke saldo Finance.`;
       current.sourceFinalityStatus = 'FINAL_CONFIRMED';
-      current.sourceFinalityNote = 'OPEN diperlakukan sebagai transaksi tervalidasi kasir Nagagold.';
+      current.sourceFinalityNote = sourceCode === 'OPTIK' ? 'status_valid OPTIK bernilai true.' : 'OPEN diperlakukan sebagai transaksi tervalidasi kasir Nagagold.';
       await current.save({ session });
       await AuditLog.create([{ actor: 'Sync Nagagold', action: 'NAGAGOLD_TRANSACTION_POSTED', entityType: 'FINANCE_TRANSACTION', entityId: id(current._id), after: { status: current.status, journalStatus: current.journal_status, saldoStatus: current.saldo_status, journalId: id(journal._id) }, correlationId: createNumber('NG-POST') }], { session });
       return { posted: true, journalId: id(journal._id) };
@@ -1670,42 +1806,20 @@ async function reverseTransferBalance(transaction, session) {
 }
 
 async function syncAccountBalances() {
-  const [accounts, openingBalances, mutations, syncTransactions, manualJournals] = await Promise.all([
+  const [accounts, journals] = await Promise.all([
     Account.find({}).select('_id').lean(),
-    // Saldo awal langsung memengaruhi saldo sejak dibuat, walaupun approval
-    // Owner belum selesai. Yang dihitung ulang hanya saldo awal yang masih
-    // berstatus diterapkan; saldo yang sudah dibalik tidak ikut dihitung.
-    OpeningBalance.find({ status: { $in: ['PENDING_APPROVAL', 'APPROVED'] }, saldo_status: BALANCE_STATUSES.APPLIED }).select('rekening_id nilai').lean(),
-    FinanceMutation.find({ status: 'APPROVED', $or: [{ journal_status: JOURNAL_STATUSES.POSTED }, { journal_status: { $exists: false } }] }).select('bentuk_transaksi rekening_asal rekening_tujuan nominal arah_dana').lean(),
-    SyncTransaction.find({ status: { $in: ['TERCATAT', 'TERHUBUNG'] } }).select('rekening_id jumlah_in jumlah_out').lean(),
-    JournalEntry.find({ no_transaksi: /^TRX-/, status: { $in: ['PROVISIONAL', 'POSTED'] }, tipe: { $in: ['PENYESUAIAN_SALDO', 'PEMBALIKAN'] } }).select('rekening_id debet kredit').lean(),
+    // tt_keuangan adalah ledger resmi. Saldo master tidak lagi dihitung dari
+    // $inc transaksi sumber, karena cara itu dapat menggandakan saldo ketika
+    // worker restart. Semua jurnal aktif dihitung, termasuk PROVISIONAL yang
+    // sudah tercatat sebagai uang; jurnal REVERSED dikeluarkan karena dampak
+    // pembaliknya disimpan sebagai jurnal POSTED tersendiri.
+    JournalEntry.find({ status: { $in: ['POSTED', 'PROVISIONAL'] } }).select('rekening_id debet kredit').lean(),
   ]);
   const balances = new Map(accounts
     .map((account) => id(account._id))
     .filter((accountId) => mongoose.isValidObjectId(accountId))
     .map((accountId) => [accountId, 0]));
-  for (const item of openingBalances) {
-    const rekeningId = id(item.rekening_id);
-    if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
-    balances.set(rekeningId, balances.get(rekeningId) + Number(item.nilai || 0));
-  }
-  for (const item of mutations) {
-    const amount = Number(item.nominal || 0);
-    const sourceAccountId = id(item.rekening_asal);
-    const destinationAccountId = id(item.rekening_tujuan);
-    if (mongoose.isValidObjectId(sourceAccountId) && balances.has(sourceAccountId)) {
-      balances.set(sourceAccountId, balances.get(sourceAccountId) - amount);
-    }
-    if (mongoose.isValidObjectId(destinationAccountId) && balances.has(destinationAccountId)) {
-      balances.set(destinationAccountId, balances.get(destinationAccountId) + amount);
-    }
-  }
-  for (const item of syncTransactions) {
-    const rekeningId = id(item.rekening_id);
-    if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
-    balances.set(rekeningId, balances.get(rekeningId) + Number(item.jumlah_in || 0) - Number(item.jumlah_out || 0));
-  }
-  for (const item of manualJournals) {
+  for (const item of journals) {
     const rekeningId = id(item.rekening_id);
     if (!mongoose.isValidObjectId(rekeningId) || !balances.has(rekeningId)) continue;
     balances.set(rekeningId, balances.get(rekeningId) + Number(item.debet || 0) - Number(item.kredit || 0));
@@ -1746,6 +1860,106 @@ async function ensureSystemCashBank() {
 }
 
 async function ensureSafeFinanceIndexes() {
+  await Branch.collection.updateMany(
+    { $or: [{ jenis_bisnis: { $exists: false } }, { jenis_bisnis: '' }, { jenis_bisnis: null }] },
+    { $set: { jenis_bisnis: 'NAGAGOLD' } },
+  );
+  const branchIndexes = await Branch.collection.indexes();
+  // Index lama membuat kode toko global-unik. Itu tidak sesuai karena kode
+  // cabang Nagagold dan Optik boleh sama; identitasnya dibedakan oleh sumber.
+  for (const legacyIndex of branchIndexes) {
+    const key = JSON.stringify(legacyIndex.key || {});
+    const isGlobalKodeIndex = key === JSON.stringify({ kode_toko: 1 }) && legacyIndex.name !== 'uniq_cabang_sumber_kode';
+    if (isGlobalKodeIndex && legacyIndex.name !== '_id_') {
+      await Branch.collection.dropIndex(legacyIndex.name);
+      console.info(`Index global kode toko ${legacyIndex.name} dihapus; identitas cabang kini memakai jenis bisnis + kode toko.`);
+    }
+  }
+  let currentBranchIndexes = await Branch.collection.indexes();
+  const duplicateScopedBranches = await Branch.collection.aggregate([
+    { $group: { _id: { jenis_bisnis: { $ifNull: ['$jenis_bisnis', 'NAGAGOLD'] }, kode_toko: '$kode_toko' }, count: { $sum: 1 } } },
+    { $match: { count: { $gt: 1 } } },
+    { $limit: 1 },
+  ]).hasNext();
+  if (!currentBranchIndexes.some((index) => index.name === 'uniq_cabang_sumber_kode')) {
+    if (!duplicateScopedBranches) await Branch.collection.createIndex({ jenis_bisnis: 1, kode_toko: 1 }, { unique: true, name: 'uniq_cabang_sumber_kode' });
+    else console.warn('Index cabang sumber + kode ditunda karena masih ada duplikasi pada sumber yang sama.');
+  }
+  currentBranchIndexes = await Branch.collection.indexes();
+  const duplicateSourceDatabases = await Branch.collection.aggregate([
+    { $match: { database_name: { $exists: true, $nin: ['', null] } } },
+    { $group: { _id: { jenis_bisnis: { $ifNull: ['$jenis_bisnis', 'NAGAGOLD'] }, database_name: '$database_name' }, count: { $sum: 1 } } },
+    { $match: { count: { $gt: 1 } } },
+    { $limit: 1 },
+  ]).hasNext();
+  if (!currentBranchIndexes.some((index) => index.name === 'uniq_cabang_sumber_database')) {
+    if (!duplicateSourceDatabases) await Branch.collection.createIndex({ jenis_bisnis: 1, database_name: 1 }, { unique: true, name: 'uniq_cabang_sumber_database' });
+    else console.warn('Index cabang sumber + database ditunda karena masih ada duplikasi pada sumber yang sama.');
+  }
+
+  const syncStateIndexes = await SyncState.collection.indexes();
+  for (const legacyIndex of syncStateIndexes) {
+    const key = JSON.stringify(legacyIndex.key || {});
+    if (key === JSON.stringify({ sourceSystem: 1, kodeToko: 1, sourceCollection: 1 }) && legacyIndex.name !== '_id_') {
+      await SyncState.collection.dropIndex(legacyIndex.name);
+    }
+  }
+  const currentSyncStateIndexes = await SyncState.collection.indexes();
+  if (!currentSyncStateIndexes.some((index) => index.name === 'uniq_sync_state_source_database')) {
+    const duplicateStates = await SyncState.collection.aggregate([
+      { $group: { _id: { sourceSystem: '$sourceSystem', sourceDatabase: { $ifNull: ['$sourceDatabase', ''] }, kodeToko: '$kodeToko', sourceCollection: '$sourceCollection' }, count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+      { $limit: 1 },
+    ]).hasNext();
+    if (!duplicateStates) await SyncState.collection.createIndex({ sourceSystem: 1, sourceDatabase: 1, kodeToko: 1, sourceCollection: 1 }, { unique: true, name: 'uniq_sync_state_source_database' });
+    else console.warn('Index cursor sinkronisasi ditunda karena ada state sumber duplikat.');
+  }
+
+  const syncIndexes = await SyncTransaction.collection.indexes();
+  for (const legacyIndex of syncIndexes) {
+    const key = JSON.stringify(legacyIndex.key || {});
+    const isLegacyTransactionNumberIndex = Object.prototype.hasOwnProperty.call(legacyIndex.key || {}, 'transactionNumber');
+    if ((key === JSON.stringify({ sumber: 1, kode_toko: 1, id_sumber: 1 }) || isLegacyTransactionNumberIndex) && legacyIndex.name !== '_id_') {
+      await SyncTransaction.collection.dropIndex(legacyIndex.name);
+      if (isLegacyTransactionNumberIndex) console.info(`Index sinkronisasi lama ${legacyIndex.name} dihapus; identitas transaksi kini memakai sumber + database + toko + ID sumber.`);
+    }
+  }
+  const currentSyncIndexes = await SyncTransaction.collection.indexes();
+  if (!currentSyncIndexes.some((index) => index.name === 'uniq_tt_sinkronisasi_sumber_database')) {
+    const duplicateSyncRows = await SyncTransaction.collection.aggregate([
+      { $group: { _id: { sumber: '$sumber', database_name: { $ifNull: ['$database_name', ''] }, kode_toko: '$kode_toko', id_sumber: '$id_sumber' }, count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+      { $limit: 1 },
+    ]).hasNext();
+    if (!duplicateSyncRows) await SyncTransaction.collection.createIndex({ sumber: 1, database_name: 1, kode_toko: 1, id_sumber: 1 }, { unique: true, name: 'uniq_tt_sinkronisasi_sumber_database' });
+    else console.warn('Index sinkronisasi sumber ditunda karena ada dokumen duplikat yang perlu direkonsiliasi.');
+  }
+
+  // Mapping rekening sekarang berlaku per jenis bisnis + rekening sumber,
+  // bukan per cabang. Hapus index lama yang masih memaksa setiap cabang
+  // memiliki mapping terpisah.
+  let mappingIndexes = await NagagoldAccountMapping.collection.indexes();
+  for (const legacyIndex of mappingIndexes) {
+    const fields = Object.keys(legacyIndex.key || {});
+    const obsolete = ['uniq_nagagold_mapping_context', 'uniq_nagagold_mapping_source_account'].includes(legacyIndex.name)
+      || (fields.includes('kode_toko') && fields.includes('metode_pembayaran'))
+      || (fields.includes('kode_bank') && fields.includes('nomor_rekening'));
+    if (obsolete && legacyIndex.name !== '_id_') {
+      await NagagoldAccountMapping.collection.dropIndex(legacyIndex.name);
+      console.info(`Index mapping lama ${legacyIndex.name} dihapus; mapping kini berlaku per jenis bisnis dan rekening sumber.`);
+    }
+  }
+  mappingIndexes = await NagagoldAccountMapping.collection.indexes();
+  if (!mappingIndexes.some((index) => index.name === 'uniq_nagagold_mapping_source_account_number')) {
+    const duplicateMappings = await NagagoldAccountMapping.collection.aggregate([
+      { $group: { _id: { source_system: '$source_system', unit: '$unit', nomor_rekening: { $ifNull: ['$nomor_rekening', ''] } }, count: { $sum: 1 } } },
+      { $match: { count: { $gt: 1 } } },
+      { $limit: 1 },
+    ]).hasNext();
+    if (!duplicateMappings) await NagagoldAccountMapping.collection.createIndex({ source_system: 1, unit: 1, nomor_rekening: 1 }, { unique: true, name: 'uniq_nagagold_mapping_source_account_number' });
+    else console.warn('Index mapping rekening sumber ditunda karena masih ada mapping duplikat yang perlu direkonsiliasi.');
+  }
+
   const bankIndexes = await Bank.collection.indexes();
   for (const legacyIndex of bankIndexes.filter((index) => ['code', 'kodeBank'].some((field) => index.key?.[field]))) {
     const legacyField = Object.keys(legacyIndex.key).find((field) => ['code', 'kodeBank'].includes(field));
@@ -1870,7 +2084,11 @@ function sourceBusinessDate(value) {
 }
 
 function sourceIdOf(item) {
-  return String(item._id || item.source_id || item.sourceId || item.no_reff || '').trim();
+  return String(item._id || item.source_id || item.sourceId || item.no_reff || item.no_ref || '').trim();
+}
+
+function sourceReferenceOf(item) {
+  return String(item.no_reff || item.no_ref || item.source_no_reff || item.sourceNoReff || '').trim();
 }
 
 function sourceRequestIdOf(item) {
@@ -1883,65 +2101,148 @@ function sourceDirection(item) {
   if (incoming > 0 && outgoing > 0) throw new HttpError(422, `Transaksi sumber ${sourceIdOf(item)} memiliki jumlah masuk dan keluar sekaligus.`);
   if (incoming > 0) return { amount: incoming, direction: 'MASUK' };
   if (outgoing > 0) return { amount: outgoing, direction: 'KELUAR' };
+  // OPTIK menyimpan arah buku pada type_trx (D = masuk/debet, K =
+  // keluar/kredit). Jumlah masuk/keluar tetap menjadi sumber nominal utama;
+  // fallback ini hanya dipakai bila sumber mengirim total_rp tanpa mengisi
+  // salah satu kolom jumlah tersebut.
+  const total = Number(item.total_rp || item.totalRp || item.nominal || 0);
+  const type = String(item.type_trx || '').trim().toUpperCase();
+  if (total > 0 && type === 'D') return { amount: total, direction: 'MASUK' };
+  if (total > 0 && type === 'K') return { amount: total, direction: 'KELUAR' };
   return { amount: 0, direction: 'MASUK' };
 }
 
 async function findSourceAccountCandidates(item, branch) {
-  const noRekening = normalizeNagagoldValue(item.no_rekening || item.noRekening);
+  const noRekening = normalizeNagagoldValue(item.source_no_rekening || item.sourceNoRekening || item.no_rekening || item.noRekening);
   const unit = sourceBusinessUnit(branch);
+  const metodePembayaran = sourcePaymentMethod(item).toUpperCase();
+  if (branch.jenisBisnis === 'OPTIK' && metodePembayaran === 'BPJS') {
+    return Account.find({
+      aktif: true,
+      unit,
+      kelompok_rekening: 'KAS_KECIL',
+      bentuk_saldo: 'KAS_TUNAI',
+    }).populate({ path: 'bank_id', select: 'kode_bank nama_bank' }).sort({ created_at: 1, _id: 1 }).limit(1).lean();
+  }
+  if (branch.jenisBisnis === 'OPTIK' && ['QRIS', 'GOPAY'].includes(metodePembayaran)) {
+    const bank = await Bank.findOne({ kode_bank: 'BCA', aktif: true }).select('_id').lean();
+    if (!bank) return [];
+    return Account.find({
+      aktif: true,
+      unit,
+      kelompok_rekening: 'KAS_KECIL',
+      bentuk_saldo: 'REKENING_BANK',
+      bank_id: bank._id,
+    }).populate({ path: 'bank_id', select: 'kode_bank nama_bank' }).sort({ created_at: 1, _id: 1 }).limit(1).lean();
+  }
   if (isCashPayment(item)) {
     return Account.find({
       aktif: true,
       unit,
+      // Semua transaksi yang datang dari sumber operasional (Nagagold/Optik)
+      // wajib masuk ke penyimpanan operasional Kas Kecil. Jangan memilih akun
+      // tunai Kas Besar/Kas Utama hanya karena akun itu kebetulan satu-satunya
+      // kandidat yang tersedia.
+      kelompok_rekening: 'KAS_KECIL',
       bentuk_saldo: 'KAS_TUNAI',
-    }).sort({ created_at: 1 }).lean();
+    }).populate({ path: 'bank_id', select: 'kode_bank nama_bank' }).sort({ created_at: 1 }).lean();
   }
   if (!noRekening) return [];
-  const kodeBank = normalizeNagagoldValue(item.kode_bank || item.kodeBank).toUpperCase();
-  if (kodeBank) {
-    const bank = await Bank.findOne({ kode_bank: kodeBank, aktif: true }).select('_id').lean();
-    if (!bank) return [];
-    const bankAccounts = await Account.find({ nomor_rekening: noRekening, bank_id: bank._id, aktif: true }).lean();
-    const contextual = bankAccounts.filter((account) => !account.kode_toko || account.kode_toko === String(branch?.kodeToko || '').toUpperCase());
-    return contextual;
-  }
-  const accounts = await Account.find({ nomor_rekening: noRekening, aktif: true }).lean();
-  const contextual = accounts.filter((account) => (!account.unit || account.unit === unit) && (!account.kode_toko || account.kode_toko === String(branch?.kodeToko || '').toUpperCase()));
-  return contextual;
+  // Nomor rekening adalah identitas rekening sumber untuk seluruh sistem
+  // sinkronisasi. Format kode bank pada sumber dapat berbeda dari Finance,
+  // sedangkan nama bank hanya informasi tampilan. Jika nomor rekening sama
+  // pada lebih dari satu rekening Finance, hasilnya tetap ambigu dan harus
+  // dipetakan secara eksplisit.
+  return Account.find({
+    nomor_rekening: noRekening,
+    aktif: true,
+    unit,
+    kelompok_rekening: 'KAS_KECIL',
+    bentuk_saldo: 'REKENING_BANK',
+  }).populate({ path: 'bank_id', select: 'kode_bank nama_bank' }).lean();
 }
 
 function mappingContextFor(item, branch) {
+  const source = sourceConfigForBranch(branch);
   const metodePembayaran = sourcePaymentMethod(item).toUpperCase();
   const cash = isCashPayment(item);
   return {
-    source_system: 'nagagold',
-    // CASH dipetakan berdasarkan bentuk penyimpanan dan unit bisnis. Kode
-    // toko hanya merupakan metadata transaksi, bukan identitas akun Finance.
-    kode_toko: cash ? '*' : String(branch?.kodeToko || '').toUpperCase(),
+    source_system: source.key,
+    // Mapping berlaku untuk seluruh cabang dalam unit bisnis yang sama. Kode
+    // toko tetap disimpan sebagai metadata pada transaksi sumber, bukan kunci
+    // pemetaan rekening.
+    kode_toko: '*',
     unit: sourceBusinessUnit(branch),
     metode_pembayaran: metodePembayaran,
-    kode_bank: cash ? '' : normalizeNagagoldValue(item.kode_bank || item.kodeBank).toUpperCase(),
-    nomor_rekening: cash ? '' : normalizeNagagoldValue(item.no_rekening || item.noRekening),
+    kode_bank: cash ? '' : normalizeNagagoldValue(item.source_kode_bank || item.sourceKodeBank || item.kode_bank || item.kodeBank).toUpperCase(),
+    nomor_rekening: cash ? '' : normalizeNagagoldValue(item.source_no_rekening || item.sourceNoRekening || item.no_rekening || item.noRekening),
   };
 }
 
 async function resolveNagagoldAccount(item, branch) {
   const context = mappingContextFor(item, branch);
-  const configured = await NagagoldAccountMapping.find({ ...context, aktif: true }).sort({ dibuat_pada: 1 }).lean();
+  const sourceIsCash = isCashPayment(item);
+  const metodePembayaran = sourcePaymentMethod(item).toUpperCase();
+  const isOptikBpjs = branch.jenisBisnis === 'OPTIK' && metodePembayaran === 'BPJS';
+  const isOptikDigitalPayment = branch.jenisBisnis === 'OPTIK' && ['QRIS', 'GOPAY'].includes(metodePembayaran);
+  const mappingKey = {
+    source_system: context.source_system,
+    unit: context.unit,
+    nomor_rekening: context.nomor_rekening,
+  };
+  // Untuk sementara Finance memakai aturan tetap pada metode khusus Optik:
+  // BPJS ke kas tunai Kas Kecil pertama, sedangkan QRIS/GOPAY ke rekening BCA
+  // Kas Kecil pertama. Tidak ada lookup ke collection klaim BPJS dan tidak ada
+  // pembuatan rekening otomatis jika master belum tersedia.
+  if (isOptikBpjs || isOptikDigitalPayment) {
+    const candidates = await findSourceAccountCandidates(item, branch);
+    if (candidates.length === 1) {
+      return {
+        account: candidates[0],
+        status: 'TERPETAKAN',
+        reason: isOptikBpjs
+          ? 'BPJS Optik sementara dibukukan ke kas tunai Kas Kecil pertama.'
+          : `Pembayaran ${metodePembayaran} Optik sementara dibukukan ke rekening BCA Kas Kecil pertama.`,
+        candidateIds: [id(candidates[0]._id)],
+        ruleKey: isOptikBpjs ? 'OPTIK_BPJS_DEFAULT_CASH' : 'OPTIK_DIGITAL_DEFAULT_BCA',
+      };
+    }
+    return {
+      account: null,
+      status: 'PERLU_PEMETAAN',
+      reason: isOptikBpjs
+        ? 'Kas tunai Kas Kecil Optik belum tersedia.'
+        : 'Rekening BCA Kas Kecil Optik belum tersedia.',
+      candidateIds: candidates.map((account) => id(account._id)),
+      ruleKey: isOptikBpjs ? 'OPTIK_BPJS_DEFAULT_CASH' : 'OPTIK_DIGITAL_DEFAULT_BCA',
+    };
+  }
+  const configured = await NagagoldAccountMapping.find({ ...mappingKey, aktif: true }).sort({ dibuat_pada: 1 }).lean();
   if (configured.length > 1) {
-    return { account: null, status: 'PEMETAAN_AMBIGU', reason: 'Terdapat lebih dari satu konfigurasi mapping aktif untuk cabang, metode pembayaran, bank, dan rekening ini.', candidateIds: configured.map((mapping) => id(mapping.rekening_id)), ruleKey: 'CONFIGURED_MAPPING' };
+    return { account: null, status: 'PEMETAAN_AMBIGU', reason: 'Terdapat lebih dari satu konfigurasi mapping aktif untuk jenis bisnis, bank, dan rekening sumber ini.', candidateIds: configured.map((mapping) => id(mapping.rekening_id)), ruleKey: 'CONFIGURED_MAPPING' };
   }
   if (configured.length === 1) {
-    const account = await Account.findOne({ _id: configured[0].rekening_id, aktif: true }).lean();
+    const account = await Account.findOne({ _id: configured[0].rekening_id, aktif: true }).populate({ path: 'bank_id', select: 'kode_bank nama_bank' }).lean();
     if (!account) return { account: null, status: 'GAGAL_MAPPING', reason: 'Konfigurasi mapping menunjuk ke rekening yang sudah tidak aktif atau tidak ditemukan.', candidateIds: [id(configured[0].rekening_id)], ruleKey: 'CONFIGURED_MAPPING' };
-    return { account, status: 'TERPETAKAN', reason: 'Mapping konfigurasi cabang dan metode pembayaran digunakan.', candidateIds: [id(account._id)], ruleKey: 'CONFIGURED_MAPPING' };
+    if (account.unit !== context.unit || account.kelompok_rekening !== 'KAS_KECIL' || (sourceIsCash ? account.bentuk_saldo !== 'KAS_TUNAI' : account.bentuk_saldo !== 'REKENING_BANK')) {
+      return {
+        account: null,
+        status: 'GAGAL_MAPPING',
+        reason: sourceIsCash
+          ? 'Mapping transaksi CASH sumber hanya boleh menuju akun TUNAI pada Kas Kecil dengan jenis bisnis yang sama.'
+          : 'Mapping transaksi rekening sumber hanya boleh menuju rekening bank pada Kas Kecil dengan jenis bisnis yang sama.',
+        candidateIds: [id(account._id)],
+        ruleKey: 'CONFIGURED_MAPPING_INVALID_LEVEL',
+      };
+    }
+    return { account, status: 'TERPETAKAN', reason: 'Mapping jenis bisnis dan rekening sumber digunakan.', candidateIds: [id(account._id)], ruleKey: 'CONFIGURED_MAPPING' };
   }
   const candidates = await findSourceAccountCandidates(item, branch);
   if (candidates.length === 1) return { account: candidates[0], status: 'TERPETAKAN', reason: 'Mapping unik ditemukan dari Master Rekening berdasarkan konteks sumber.', candidateIds: [id(candidates[0]._id)], ruleKey: 'DIRECT_MASTER_UNIQUE' };
   if (candidates.length > 1) return { account: null, status: 'PEMETAAN_AMBIGU', reason: 'Lebih dari satu rekening cocok; Admin harus memilih mapping yang benar.', candidateIds: candidates.map((account) => id(account._id)), ruleKey: 'DIRECT_MASTER_AMBIGUOUS' };
   return { account: null, status: 'PERLU_PEMETAAN', reason: isCashPayment(item)
     ? `Kas tunai unit ${context.unit} belum memiliki rekening penyimpanan TUNAI yang cocok.`
-    : 'Rekening sumber belum ditemukan berdasarkan bank, nomor rekening, unit, dan cabang.', candidateIds: [], ruleKey: 'DIRECT_MASTER_NOT_FOUND' };
+    : 'Rekening sumber belum ditemukan berdasarkan jenis bisnis dan nomor rekening.', candidateIds: [], ruleKey: 'DIRECT_MASTER_NOT_FOUND' };
 }
 
 function invoiceType(invoiceNumber, category = '') {
@@ -1970,6 +2271,15 @@ function sourceInvoiceDetails(item) {
     const nomorFaktur = String(number || '').trim();
     if (nomorFaktur && !details.some((detail) => detail.nomorFaktur === nomorFaktur)) details.push({ nomorFaktur, jenisFaktur: invoiceType(nomorFaktur, category), nilaiFaktur: 0, isLm: false, isBerlian: false, isAcc: false });
   }
+  // OPTIK tidak mempunyai detail_transaction pada tt_cash_daily. Referensi
+  // faktur tetap tercatat di deskripsi, misalnya:
+  // "KTJ-FJ-261015-0001 REFUND REVISI FJ-260613-0002".
+  const description = String(item.deskripsi || item.keterangan || '').toUpperCase();
+  const descriptionNumbers = description.match(/\b(?:[A-Z0-9]+-)?F[JB]-\d{6}-\d{4}\b/g) || [];
+  for (const number of descriptionNumbers) {
+    const nomorFaktur = String(number || '').trim();
+    if (nomorFaktur && !details.some((detail) => detail.nomorFaktur === nomorFaktur)) details.push({ nomorFaktur, jenisFaktur: invoiceType(nomorFaktur, category), nilaiFaktur: 0, isLm: false, isBerlian: false, isAcc: false });
+  }
   return details;
 }
 
@@ -1988,7 +2298,12 @@ function sourceDecryptionAudit(item, branch) {
   return { status: keyConfigured ? 'READABLE' : 'NOT_APPLICABLE', note: keyConfigured ? 'Field sumber berhasil melewati pemeriksaan keterbacaan.' : 'Respons sumber diasumsikan sudah plaintext; key dekripsi tidak digunakan.' };
 }
 
-function sourceFinalityAudit(item) {
+function sourceFinalityAudit(item, branch = {}) {
+  const source = sourceConfigForBranch(branch);
+  if (source.code === 'OPTIK') {
+    if (item.status_valid === true) return { status: 'FINAL_CONFIRMED', note: 'status_valid OPTIK bernilai true.' };
+    return { status: 'FINALITY_UNPROVEN', note: 'Transaksi OPTIK hanya dapat diproses jika status_valid bernilai true.' };
+  }
   const status = String(item.status || '').trim().toUpperCase();
   if (status === 'OPEN') return { status: 'FINAL_CONFIRMED', note: 'Status OPEN diperlakukan sebagai transaksi yang sudah divalidasi kasir Nagagold sesuai aturan bisnis Finance.' };
   if (status === 'DONE') return { status: 'FINALITY_UNPROVEN', note: 'Kode Nagagold mengubah status DONE menjadi OPEN saat validasi cash; DONE tidak dianggap final tanpa aturan bisnis tambahan.' };
@@ -2007,17 +2322,20 @@ function sourceSnapshotFingerprint(snapshot) {
     jenisSumber: snapshot.jenisSumber || '',
     kategoriSumber: snapshot.kategoriSumber || '',
     statusSumber: snapshot.statusSumber || '',
+    sourceDeskripsi: snapshot.sourceDeskripsi || '',
+    sourceKeterangan: snapshot.sourceKeterangan || '',
     sourceInvoiceNumbers: snapshot.sourceInvoiceNumbers || [],
     sourceDetailTransaction: snapshot.sourceDetailTransaction || [],
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
-function buildNagagoldSourceSnapshot(item, branch) {
+function buildSourceSnapshot(item, branch) {
+  const source = sourceConfigForBranch(branch);
   const invoiceDetails = sourceInvoiceDetails(item);
   const snapshot = {
     sourceRequestId: sourceRequestIdOf(item),
-    sourceNoReff: String(item.no_reff || item.source_no_reff || '').trim(),
+    sourceNoReff: sourceReferenceOf(item),
     sourceTanggal: String(item.tanggal || sourceDate(item.input_date).toISOString().slice(0, 10)).slice(0, 10),
     sourceNoRekening: normalizeNagagoldValue(item.no_rekening || item.noRekening),
     sourceKodeBank: normalizeNagagoldValue(item.kode_bank || item.kodeBank).toUpperCase(),
@@ -2027,21 +2345,22 @@ function buildNagagoldSourceSnapshot(item, branch) {
     jenisSumber: String(item.jenis || item.jenis_sumber || '').toUpperCase(),
     kategoriSumber: String(item.kategori || item.kategori_sumber || '').toUpperCase(),
     statusSumber: String(item.status || '').toUpperCase(),
-    sourceIsValidate: typeof item.is_validate === 'boolean' ? item.is_validate : null,
+    sourceIsValidate: typeof item.status_valid === 'boolean' ? item.status_valid : (typeof item.is_validate === 'boolean' ? item.is_validate : null),
     sourceStatusReceive: typeof item.status_receive === 'boolean' ? item.status_receive : null,
     sourceInputDate: item.input_date || item.inputDate || null,
     sourceDeskripsi: String(item.deskripsi || '').trim(),
-    sourceKeterangan: String(item.keterangan || item.note || '').trim(),
+    sourceKeterangan: String(item.keterangan || item.notes || item.note || '').trim(),
     sourceDetailTransaction: Array.isArray(item.detail_transaction) ? item.detail_transaction : [],
     sourceInvoiceNumbers: invoiceDetails.map((detail) => detail.nomorFaktur),
+    detailFaktur: invoiceDetails.map((detail) => detail.nomorFaktur),
     sourceInvoiceDetails: invoiceDetails,
   };
   const decryption = sourceDecryptionAudit(item, branch);
-  const finality = sourceFinalityAudit(item);
+  const finality = sourceFinalityAudit(item, branch);
   return {
     ...snapshot,
     sourceSnapshotAt: now(),
-    sourceSnapshotProvenance: { sourceSystem: 'nagagold', jenisBisnis: branch.jenisBisnis || 'NAGAGOLD', sourceCollection: NAGAGOLD_COLLECTION, kodeToko: branch.kodeToko, databaseName: branch.databaseName, readMode: 'DIRECT_MONGODB', capturedAt: now().toISOString() },
+    sourceSnapshotProvenance: { sourceSystem: source.key, jenisBisnis: branch.jenisBisnis || source.code, sourceCollection: source.collection, kodeToko: branch.kodeToko, databaseName: branch.databaseName, readMode: 'DIRECT_MONGODB', capturedAt: now().toISOString() },
     sourceSnapshotFingerprint: sourceSnapshotFingerprint(snapshot),
     sourceSnapshotRecoveryStatus: 'NOT_NEEDED',
     sourceDecryptionStatus: decryption.status,
@@ -2051,7 +2370,12 @@ function buildNagagoldSourceSnapshot(item, branch) {
   };
 }
 
+function buildNagagoldSourceSnapshot(item, branch) {
+  return buildSourceSnapshot(item, branch);
+}
+
 async function ingestNagagoldItems(branch, items) {
+  const source = sourceConfigForBranch(branch);
   let inserted = 0;
   let updated = 0;
   let posted = 0;
@@ -2061,16 +2385,25 @@ async function ingestNagagoldItems(branch, items) {
       skippedOpeningBalances += 1;
       continue;
     }
+    // OPTIK hanya mengirim transaksi yang sudah dinyatakan valid. Record
+    // draft, batal, atau belum tervalidasi tidak boleh masuk ke Finance.
+    if (source.code === 'OPTIK' && item.status_valid !== true) continue;
     const sourceId = sourceIdOf(item);
     if (!sourceId) continue;
-    const sourceKey = `nagagold:${branch.kodeToko}:${NAGAGOLD_COLLECTION}:${sourceId}`;
+    const sourceKey = `${source.key}:${branch.databaseName}:${branch.kodeToko}:${source.collection}:${sourceId}`;
     const direction = sourceDirection(item);
     if (!direction.amount) continue;
     const requestId = sourceRequestIdOf(item);
-    const existing = await SyncTransaction.findOne({ sourceKey });
+    const existing = await SyncTransaction.findOne({
+      sumber: source.code,
+      database_name: branch.databaseName,
+      kode_toko: branch.kodeToko,
+      id_sumber: sourceId,
+    });
     const mapping = await resolveNagagoldAccount(item, branch);
     const account = mapping.account;
-    const sourceSnapshot = buildNagagoldSourceSnapshot(item, branch);
+    const financeAccount = financeAccountSnapshot(account);
+    const sourceSnapshot = buildSourceSnapshot(item, branch);
     const sourceStatus = String(item.status || '').toUpperCase();
     const mapped = Boolean(account);
     const importedState = importedSyncState(item, mapping, branch);
@@ -2085,9 +2418,17 @@ async function ingestNagagoldItems(branch, items) {
       arahDana: direction.direction,
       kodeToko: branch.kodeToko,
       namaTokoSnapshot: branch.namaToko,
+      cabang_id: branch.id || null,
       sourceAccountId: null,
       destinationAccountId: null,
       rekeningId: account?._id || null,
+      // Field rekening/bank pada tt_sinkronisasi selalu snapshot dari master
+      // Finance hasil mapping. Nilai mentah sumber ada di source_*.
+      no_rekening: financeAccount.no_rekening,
+      kode_bank: financeAccount.kode_bank,
+      nama_bank: financeAccount.nama_bank,
+      nama_rekening: financeAccount.nama_rekening,
+      bank_id: financeAccount.bank_id,
       amount: direction.amount,
       note: sourceSnapshot.sourceKeterangan || sourceSnapshot.sourceDeskripsi,
       isImported: true,
@@ -2097,14 +2438,15 @@ async function ingestNagagoldItems(branch, items) {
       // audit, recovery snapshot, serta rekonsiliasi lintas cabang.
       sourceDatabase: branch.databaseName,
       source_database_name: branch.databaseName,
+      database_name: branch.databaseName,
       sourceCollection: NAGAGOLD_COLLECTION,
       sourceId,
       sourceKey,
       source_transaction_id: sourceId,
       sourceNoReff: sourceSnapshot.sourceNoReff,
-      sourceNoRekening: sourceSnapshot.sourceNoRekening,
-      sourceKodeBank: sourceSnapshot.sourceKodeBank,
-      sourceNamaBank: sourceSnapshot.sourceNamaBank,
+      source_no_rekening: sourceSnapshot.sourceNoRekening,
+      source_kode_bank: sourceSnapshot.sourceKodeBank,
+      source_nama_bank: sourceSnapshot.sourceNamaBank,
       sourceTanggal: sourceSnapshot.sourceTanggal,
       sourceDeskripsi: sourceSnapshot.sourceDeskripsi,
       sourceKeterangan: sourceSnapshot.sourceKeterangan,
@@ -2130,6 +2472,8 @@ async function ingestNagagoldItems(branch, items) {
       sourceFinalityStatus: sourceSnapshot.sourceFinalityStatus,
       sourceFinalityNote: sourceSnapshot.sourceFinalityNote,
       source_payment_method: sourcePaymentMethod(item),
+      detailFaktur: sourceSnapshot.detailFaktur,
+      sourceIsValidate: sourceSnapshot.sourceIsValidate,
       status: existing?.status === 'APPROVED' || existing?.status === 'REJECTED' ? existing.status : 'MENUNGGU_VALIDASI_ADMIN',
       source_type: SOURCE_TYPES.SYNC,
       sync_status: existing?.status === 'APPROVED' || existing?.status === 'REJECTED' ? (existing?.sync_status || importedState.status) : importedState.status,
@@ -2148,7 +2492,7 @@ async function ingestNagagoldItems(branch, items) {
     };
     if (existing) {
       const refreshData = existing.status === 'APPROVED' || existing.status === 'REJECTED'
-        ? { requestId: transactionData.requestId, statusSumber: transactionData.statusSumber, sourceIsValidate: transactionData.sourceIsValidate, sourceStatusReceive: transactionData.sourceStatusReceive, sourceNoReff: transactionData.sourceNoReff, sourceNoRekening: transactionData.sourceNoRekening, sourceKodeBank: transactionData.sourceKodeBank, sourceNamaBank: transactionData.sourceNamaBank, sourceTanggal: transactionData.sourceTanggal, sourceDeskripsi: transactionData.sourceDeskripsi, sourceKeterangan: transactionData.sourceKeterangan, sourceDetailTransaction: transactionData.sourceDetailTransaction, source_amount_in: transactionData.source_amount_in, source_amount_out: transactionData.source_amount_out, jenisSumber: transactionData.jenisSumber, kategoriSumber: transactionData.kategoriSumber, source_database_name: transactionData.source_database_name, source_transaction_id: transactionData.source_transaction_id, source_payment_method: transactionData.source_payment_method, sourceDecryptionStatus: transactionData.sourceDecryptionStatus, sourceDecryptionNote: transactionData.sourceDecryptionNote, sourceSnapshotAt: transactionData.sourceSnapshotAt, sourceSnapshotProvenance: transactionData.sourceSnapshotProvenance, sourceSnapshotFingerprint: transactionData.sourceSnapshotFingerprint, sourceSnapshotRecoveryStatus: transactionData.sourceSnapshotRecoveryStatus, sourceFinalityStatus: transactionData.sourceFinalityStatus, sourceFinalityNote: transactionData.sourceFinalityNote, mappingReason: transactionData.mappingReason, mappingCheckedAt: transactionData.mappingCheckedAt, mappingRuleKey: transactionData.mappingRuleKey, mappingCandidateIds: transactionData.mappingCandidateIds }
+        ? { requestId: transactionData.requestId, statusSumber: transactionData.statusSumber, sourceIsValidate: transactionData.sourceIsValidate, sourceStatusReceive: transactionData.sourceStatusReceive, sourceNoReff: transactionData.sourceNoReff, source_no_rekening: transactionData.source_no_rekening, source_kode_bank: transactionData.source_kode_bank, source_nama_bank: transactionData.source_nama_bank, sourceTanggal: transactionData.sourceTanggal, sourceDeskripsi: transactionData.sourceDeskripsi, sourceKeterangan: transactionData.sourceKeterangan, sourceDetailTransaction: transactionData.sourceDetailTransaction, detailFaktur: transactionData.detailFaktur, source_amount_in: transactionData.source_amount_in, source_amount_out: transactionData.source_amount_out, jenisSumber: transactionData.jenisSumber, kategoriSumber: transactionData.kategoriSumber, source_database_name: transactionData.source_database_name, source_transaction_id: transactionData.source_transaction_id, source_payment_method: transactionData.source_payment_method, sourceDecryptionStatus: transactionData.sourceDecryptionStatus, sourceDecryptionNote: transactionData.sourceDecryptionNote, sourceSnapshotAt: transactionData.sourceSnapshotAt, sourceSnapshotProvenance: transactionData.sourceSnapshotProvenance, sourceSnapshotFingerprint: transactionData.sourceSnapshotFingerprint, sourceSnapshotRecoveryStatus: transactionData.sourceSnapshotRecoveryStatus, sourceFinalityStatus: transactionData.sourceFinalityStatus, sourceFinalityNote: transactionData.sourceFinalityNote, mappingReason: transactionData.mappingReason, mappingCheckedAt: transactionData.mappingCheckedAt, mappingRuleKey: transactionData.mappingRuleKey, mappingCandidateIds: transactionData.mappingCandidateIds, no_rekening: transactionData.no_rekening, kode_bank: transactionData.kode_bank, nama_bank: transactionData.nama_bank, nama_rekening: transactionData.nama_rekening, bank_id: transactionData.bank_id }
         : transactionData;
       await SyncTransaction.updateOne({ _id: existing._id }, { $set: { ...refreshData, status: existing.status } });
       const reconciliation = await refreshImportedReconciliation(existing._id);
@@ -2163,15 +2507,18 @@ async function ingestNagagoldItems(branch, items) {
     await classifyStoredNagagoldTransaction(created, { classifiedBy: 'Sync Nagagold', reconciliationCandidateCount: reconciliation.candidates });
     const posting = await postImportedNagagoldTransaction(created._id);
     if (posting.posted) posted += 1;
-    await Notification.create({ type: 'NAGAGOLD_TRANSACTION', title: 'Transaksi Nagagold baru', message: `${branch.kodeToko} memiliki transaksi ${created.kategoriSumber || created.jenisSumber} sebesar ${created.amount}.`, referenceType: 'NAGAGOLD_TRANSACTION', referenceId: id(created._id) });
+    await Notification.create({ type: 'SOURCE_TRANSACTION', title: `Transaksi ${source.code} baru`, message: `${branch.kodeToko} memiliki transaksi ${created.kategoriSumber || created.jenisSumber} sebesar ${created.amount}.`, referenceType: 'SOURCE_TRANSACTION', referenceId: id(created._id) });
     inserted += 1;
   }
   return { inserted, updated, posted, skippedOpeningBalances };
 }
 
 async function reprocessNagagoldTransactions(branch) {
+  const source = sourceConfigForBranch(branch);
   const limit = Math.min(5000, Math.max(1, Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000)));
   const rows = await SyncTransaction.find(nagagoldTransactionQuery({
+    sumber: source.code,
+    database_name: branch.databaseName,
     kodeToko: branch.kodeToko,
     $or: [{ journal_status: { $ne: JOURNAL_STATUSES.POSTED } }, { saldo_status: { $ne: BALANCE_STATUSES.APPLIED } }],
   })).sort({ transactionDate: 1, createdAt: 1 }).limit(limit);
@@ -2184,10 +2531,49 @@ async function reprocessNagagoldTransactions(branch) {
     if (result.posted) posted += 1;
     classified += 1;
   }
-  return { scanned: rows.length, classified, posted };
+  return { source: source.code, scanned: rows.length, classified, posted, perluDiperiksa: Math.max(rows.length - posted, 0) };
+}
+
+async function reprocessNagagoldTransactionsForBusiness(jenisBisnis) {
+  const source = SOURCE_CONFIGS[normalizeSourceBusiness(jenisBisnis)];
+  const limit = Math.min(50000, Math.max(1, Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000)));
+  const rows = await SyncTransaction.find(nagagoldTransactionQuery({
+    sumber: source.code,
+    $or: [{ journal_status: { $ne: JOURNAL_STATUSES.POSTED } }, { saldo_status: { $ne: BALANCE_STATUSES.APPLIED } }],
+  })).sort({ transactionDate: 1, createdAt: 1 }).limit(limit);
+  let classified = 0;
+  let posted = 0;
+  for (const row of rows) {
+    const branch = await mappingBranch(row.kode_toko, source.code, row.cabang_id);
+    const mapping = await resolveNagagoldAccount(row, branch);
+    const financeAccount = financeAccountSnapshot(mapping.account);
+    await SyncTransaction.updateOne(
+      { _id: row._id },
+      { $set: {
+        rekening_id: mapping.account?._id || null,
+        no_rekening: financeAccount.no_rekening,
+        kode_bank: financeAccount.kode_bank,
+        nama_bank: financeAccount.nama_bank,
+        nama_rekening: financeAccount.nama_rekening,
+        bank_id: financeAccount.bank_id,
+        mappingStatus: mapping.status,
+        mappingReason: mapping.reason,
+        mappingCheckedAt: now(),
+        mappingRuleKey: mapping.ruleKey,
+        mappingCandidateIds: mapping.candidateIds || [],
+      } },
+    );
+    const reconciliation = await refreshImportedReconciliation(row._id);
+    await classifyStoredNagagoldTransaction(await SyncTransaction.findById(row._id), { classifiedBy: 'Finance Mapping', reconciliationCandidateCount: reconciliation.candidates });
+    const result = await postImportedNagagoldTransaction(row._id);
+    if (result.posted) posted += 1;
+    classified += 1;
+  }
+  return { source: source.code, scanned: rows.length, classified, posted, perluDiperiksa: Math.max(rows.length - posted, 0) };
 }
 
 const nagagoldCashIgnoreFields = new Set(['no_reff', 'tanggal', 'deskripsi', 'deskripsi_bak', 'input_date', 'no_faktur', 'kode_bank', '_id', 'status', 'no_faktur_list']);
+const optikCashIgnoreFields = new Set(['no_ref', 'tanggal', 'jam', 'type_trx', 'deskripsi', 'notes', 'input_date', 'kode_bank', 'no_rekening', 'status_valid', 'status', 'source_type', 'adjustment_parent_ref', '_id']);
 const nagagoldAccountIgnoreFields = new Set(['kode_bank', '_id']);
 
 function decryptNagagoldString(value, key) {
@@ -2198,24 +2584,40 @@ function decryptNagagoldString(value, key) {
     const code = Number.parseInt(value.slice(index, index + 2), 16);
     if (Number.isNaN(code)) return value;
     result += String.fromCharCode(code - key.charCodeAt(keyIndex));
-    keyIndex = (keyIndex + 1) % key.length;
+    // Ikuti Encryptor.decryptascii NAGAGOLD persis. Setelah key terakhir,
+    // implementasi sumber mengatur index ke 0 lalu langsung menambah 1,
+    // sehingga siklus berikutnya dimulai dari karakter kedua (bukan pertama).
+    if (keyIndex === key.length - 1) keyIndex = 0;
+    keyIndex += 1;
   }
   return result;
 }
 
-function decryptNagagoldValue(value, key, fieldName = '', ignoreFields = nagagoldCashIgnoreFields) {
-  if (!key || String(process.env.NAGAGOLD_ENCRYPTION_MODE || '1') === '0') return value;
+function decryptNagagoldValue(value, key, fieldName = '', ignoreFields = nagagoldCashIgnoreFields, encryptionMode = process.env.NAGAGOLD_ENCRYPTION_MODE) {
+  if (!key || String(encryptionMode ?? '1') === '0') return value;
   if (fieldName && ignoreFields.has(fieldName)) return value;
   if (value instanceof Date || value === null || value === undefined) return value;
-  if (Array.isArray(value)) return value.map((item) => decryptNagagoldValue(item, key, '', ignoreFields));
+  if (Array.isArray(value)) return value.map((item) => decryptNagagoldValue(item, key, '', ignoreFields, encryptionMode));
   if (typeof value === 'string') return decryptNagagoldString(value, key);
   if (typeof value !== 'object') return value;
   if (value._bsontype || value._bsontype === 'ObjectID') return value;
-  return Object.fromEntries(Object.entries(value).map(([field, item]) => [field, decryptNagagoldValue(item, key, field, ignoreFields)]));
+  return Object.fromEntries(Object.entries(value).map(([field, item]) => [field, decryptNagagoldValue(item, key, field, ignoreFields, encryptionMode)]));
 }
 
 function getNagagoldDecryptionKey(branch) {
-  return String(process.env.NAGAGOLD_DECRYPTION_KEY || '').trim();
+  const config = sourceConfigForBranch(branch);
+  return String(process.env[config.keyEnv] || (config.code === 'OPTIK' ? process.env.NAGAGOLD_DECRYPTION_KEY : '') || '').trim();
+}
+
+function sourceEncryptionMode(branch) {
+  const config = sourceConfigForBranch(branch);
+  return process.env[config.modeEnv] ?? (config.code === 'OPTIK' ? process.env.NAGAGOLD_ENCRYPTION_MODE : '1') ?? '1';
+}
+
+function sourceIgnoreFields(branch, account = false) {
+  const config = sourceConfigForBranch(branch);
+  if (config.code === 'OPTIK') return account ? new Set(['_id', 'no_rekening', 'kode_bank']) : optikCashIgnoreFields;
+  return account ? nagagoldAccountIgnoreFields : nagagoldCashIgnoreFields;
 }
 
 function sourceCursorQuery(from, to, afterCursor = null, { includeBusinessDate = false } = {}) {
@@ -2235,22 +2637,26 @@ function sourceCursorQuery(from, to, afterCursor = null, { includeBusinessDate =
 }
 
 async function readNagagoldDirectly(branch, from, to, afterCursor = null, options = {}) {
+  const source = sourceConfigForBranch(branch);
   const connection = await mongoose.createConnection(branch.mongodbUri, { dbName: branch.databaseName || undefined, serverSelectionTimeoutMS: 10000, maxPoolSize: 2 }).asPromise();
   try {
-    const documents = await connection.db.collection(NAGAGOLD_COLLECTION).find(sourceCursorQuery(from, to, afterCursor, options)).sort({ input_date: 1, _id: 1 }).limit(Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000)).toArray();
-    const key = String(branch.encryptionMode) === '0' ? '' : getNagagoldDecryptionKey(branch);
-    return documents.map((document) => decryptNagagoldValue(document, key));
+    const dateQuery = sourceCursorQuery(from, to, afterCursor, options);
+    const query = source.code === 'OPTIK' ? { $and: [dateQuery, { status_valid: true }] } : dateQuery;
+    const documents = await connection.db.collection(source.collection).find(query).sort({ input_date: 1, _id: 1 }).limit(Number(process.env[source.limitEnv] || process.env.NAGAGOLD_SYNC_LIMIT || 1000)).toArray();
+    const key = String(sourceEncryptionMode(branch)) === '0' ? '' : getNagagoldDecryptionKey(branch);
+    return documents.map((document) => decryptNagagoldValue(document, key, '', sourceIgnoreFields(branch), sourceEncryptionMode(branch)));
   } finally {
     await connection.close();
   }
 }
 
 async function readNagagoldAccountsDirectly(branch) {
+  const source = sourceConfigForBranch(branch);
   const connection = await mongoose.createConnection(branch.mongodbUri, { dbName: branch.databaseName || undefined, serverSelectionTimeoutMS: 10000, maxPoolSize: 2 }).asPromise();
   try {
     const documents = await connection.db.collection('tm_rekening').find({}).sort({ no_rekening: 1 }).limit(Number(process.env.NAGAGOLD_ACCOUNT_LIMIT || 5000)).toArray();
-    const key = String(branch.encryptionMode) === '0' ? '' : getNagagoldDecryptionKey(branch);
-    return documents.map((document) => decryptNagagoldValue(document, key, '', nagagoldAccountIgnoreFields));
+    const key = String(sourceEncryptionMode(branch)) === '0' ? '' : getNagagoldDecryptionKey(branch);
+    return documents.map((document) => decryptNagagoldValue(document, key, '', sourceIgnoreFields(branch, true), sourceEncryptionMode(branch)));
   } finally {
     await connection.close();
   }
@@ -2267,13 +2673,14 @@ function sourceIdCandidates(sourceIds = []) {
 }
 
 async function readNagagoldDocumentsByIds(branch, sourceIds) {
+  const source = sourceConfigForBranch(branch);
   const ids = sourceIdCandidates(sourceIds);
   if (!ids.length) return new Map();
   const connection = await mongoose.createConnection(branch.mongodbUri, { dbName: branch.databaseName || undefined, serverSelectionTimeoutMS: 10000, maxPoolSize: 2 }).asPromise();
   try {
-    const documents = await connection.db.collection(NAGAGOLD_COLLECTION).find({ _id: { $in: ids } }).limit(ids.length).toArray();
-    const key = String(branch.encryptionMode) === '0' ? '' : getNagagoldDecryptionKey(branch);
-    return new Map(documents.map((document) => [sourceIdOf(document), decryptNagagoldValue(document, key)]));
+    const documents = await connection.db.collection(source.collection).find({ _id: { $in: ids } }).limit(ids.length).toArray();
+    const key = String(sourceEncryptionMode(branch)) === '0' ? '' : getNagagoldDecryptionKey(branch);
+    return new Map(documents.map((document) => [sourceIdOf(document), decryptNagagoldValue(document, key, '', sourceIgnoreFields(branch), sourceEncryptionMode(branch))]));
   } finally {
     await connection.close();
   }
@@ -2329,7 +2736,8 @@ function sourcePreviewPayload(snapshot, sourceId) {
 
 function compareRecoverySource(transaction, snapshot, branch) {
   const sourceId = String(transaction.source_transaction_id || transaction.sourceId || '').trim();
-  const expectedKey = `nagagold:${String(branch.kodeToko || '').toUpperCase()}:${NAGAGOLD_COLLECTION}:${sourceId}`;
+  const source = sourceConfigForBranch(branch);
+  const expectedKey = `${source.key}:${branch.databaseName}:${String(branch.kodeToko || '').toUpperCase()}:${source.collection}:${sourceId}`;
   const identityVerified = Boolean(sourceId && transaction.sourceKey === expectedKey);
   const sourceAmount = Number(snapshot.sourceAmountIn || snapshot.sourceAmountOut || 0);
   const amountConsistent = sourceAmount > 0 && sourceAmount === Number(transaction.amount || 0) && ((snapshot.sourceAmountIn > 0 && transaction.arahDana === 'MASUK') || (snapshot.sourceAmountOut > 0 && transaction.arahDana === 'KELUAR'));
@@ -2358,11 +2766,14 @@ function compareRecoverySource(transaction, snapshot, branch) {
 async function getRecoveryBranch(transaction) {
   const kodeToko = String(transaction.kodeToko || '').trim().toUpperCase();
   const storedDatabase = String(transaction.source_database_name || transaction.sourceDatabase || '').trim();
-  const branch = await Branch.findOne({ kode_toko: kodeToko }).lean();
+  const source = sourceConfigForTransaction(transaction);
+  const branch = storedDatabase
+    ? await Branch.findOne({ ...branchBusinessQuery(source.code), database_name: storedDatabase }).lean()
+    : await Branch.findOne(branchIdentityQuery({ kodeToko, jenisBisnis: source.code })).lean();
   const databaseName = storedDatabase || String(branch?.database_name || '').trim();
-  const mongodbUri = String(process.env.NAGAGOLD_MONGODB_URI || '').trim();
+  const mongodbUri = String(process.env[source.uriEnv] || process.env.NAGAGOLD_MONGODB_URI || '').trim();
   if (!kodeToko || !databaseName || !mongodbUri) return null;
-  return { kodeToko, namaToko: branch?.nama_toko || transaction.namaTokoSnapshot || '', databaseName, mongodbUri, unit: 'NAGAGOLD', encryptionMode: process.env.NAGAGOLD_ENCRYPTION_MODE || '1' };
+  return { kodeToko, namaToko: branch?.nama_toko || transaction.namaTokoSnapshot || '', databaseName, mongodbUri, jenisBisnis: source.code, unit: source.code, encryptionMode: process.env[source.modeEnv] || process.env.NAGAGOLD_ENCRYPTION_MODE || '1' };
 }
 
 async function previewNagagoldSnapshotRecovery(transactions) {
@@ -2429,20 +2840,39 @@ function nagagoldMappingSummary(transactions) {
 }
 
 function mappingSourceItem(body) {
-  const method = String(body.metodePembayaran || body.metode_pembayaran || '').trim().toUpperCase();
-  const isCash = method === 'CASH' || method === 'TUNAI';
+  const requestedNumber = normalizeNagagoldValue(body.nomorRekening || body.nomor_rekening);
+  const requestedMethod = String(body.metodePembayaran || body.metode_pembayaran || body.jenisPembayaran || body.jenis_pembayaran || '').trim().toUpperCase();
+  const isCash = requestedMethod === 'CASH' || requestedMethod === 'TUNAI' || !requestedNumber;
+  const method = isCash ? 'CASH' : requestedMethod || 'BANK';
   return {
     jenis: isCash ? 'CASH' : method || 'BANK',
-    no_rekening: isCash ? '-' : String(body.nomorRekening || body.nomor_rekening || '').trim(),
+    no_rekening: isCash ? '-' : requestedNumber,
     kode_bank: isCash ? '' : String(body.kodeBank || body.kode_bank || '').trim().toUpperCase(),
-    paymentMethod: isCash ? 'CASH' : method || 'BANK',
+    paymentMethod: method,
   };
 }
 
-async function mappingBranch(kodeToko) {
-  const branch = await Branch.findOne({ kode_toko: String(kodeToko || '').trim().toUpperCase() }).lean();
+function mappingBusiness(jenisBisnis = '') {
+  const requestedSource = normalizeSourceBusiness(jenisBisnis);
+  const source = SOURCE_CONFIGS[requestedSource];
+  return {
+    unit: requestedSource,
+    jenisBisnis: requestedSource,
+    sourceSystem: source.key,
+  };
+}
+
+async function mappingBranch(kodeToko, sourceSystem = '', cabangId = '') {
+  const requestedSource = normalizeSourceBusiness(sourceSystem);
+  let branch = null;
+  if (cabangId && mongoose.isValidObjectId(cabangId)) {
+    branch = await Branch.findOne({ _id: cabangId, aktif: { $ne: false } }).lean();
+    if (branch && normalizeSourceBusiness(branch.jenis_bisnis) !== requestedSource) throw new HttpError(422, 'Jenis sumber dan cabang tidak sesuai.');
+  }
+  if (!branch) branch = await Branch.findOne({ ...branchIdentityQuery({ kodeToko, jenisBisnis: requestedSource }), aktif: { $ne: false } }).lean();
   if (!branch) throw new HttpError(422, 'Kode toko tidak ditemukan di tm_cabang.');
-  return { id: id(branch._id), kodeToko: branch.kode_toko, namaToko: branch.nama_toko, databaseName: branch.database_name, unit: String(branch.jenis_bisnis || 'NAGAGOLD').trim().toUpperCase() };
+  const jenisBisnis = String(branch.jenis_bisnis || 'NAGAGOLD').trim().toUpperCase();
+  return { id: id(branch._id), kodeToko: branch.kode_toko, namaToko: branch.nama_toko, databaseName: branch.database_name, unit: jenisBisnis, jenisBisnis, sourceSystem: sourceConfigForBranch({ jenisBisnis }).key };
 }
 
 async function validateNagagoldMappingAccount({ branch, body }) {
@@ -2452,37 +2882,39 @@ async function validateNagagoldMappingAccount({ branch, body }) {
   if (!account) throw new HttpError(422, 'Rekening Finance tidak ditemukan atau tidak aktif.');
   const sourceItem = mappingSourceItem(body);
   const method = sourcePaymentMethod(sourceItem);
-  const cash = method === 'CASH';
+  const cash = method === 'CASH' || method === 'BPJS';
   if (cash) {
-    if (account.bentuk_saldo !== 'KAS_TUNAI' || account.unit !== branch.unit) throw new HttpError(422, 'Mapping CASH hanya boleh ke akun dengan jenis penyimpanan TUNAI dan unit bisnis sumber yang sama.');
+    if (account.bentuk_saldo !== 'KAS_TUNAI' || account.kelompok_rekening !== 'KAS_KECIL' || account.unit !== branch.unit) throw new HttpError(422, 'Mapping kas tunai sumber hanya boleh ke akun TUNAI pada Kas Kecil dengan jenis bisnis sumber yang sama.');
   } else {
-    const accountBank = account.bank_id ? await Bank.findById(account.bank_id).lean() : null;
-    const nomorRekening = String(body.nomorRekening || body.nomor_rekening || '').trim();
-    const kodeBank = String(body.kodeBank || body.kode_bank || '').trim().toUpperCase();
-    if (account.bentuk_saldo !== 'REKENING_BANK' || !nomorRekening || !kodeBank || account.nomor_rekening !== nomorRekening) throw new HttpError(422, 'Mapping rekening bank wajib memakai kode bank dan nomor rekening yang sama dengan sumber.');
-    if (accountBank?.kode_bank !== kodeBank) throw new HttpError(422, 'Bank mapping tidak sama dengan kode bank sumber.');
+    // Kode bank sumber tidak selalu memakai format kode yang sama dengan
+    // master Finance (contoh: sumber dapat mengirim 014, sedangkan Finance
+    // menyimpan kode internal/nama bank). Rekening tujuan dipilih eksplisit
+    // oleh Admin, jadi cukup pastikan bentuk akun dan jenis bisnisnya sesuai.
+    if (account.bentuk_saldo !== 'REKENING_BANK' || account.kelompok_rekening !== 'KAS_KECIL' || account.unit !== branch.unit) throw new HttpError(422, 'Mapping rekening bank sumber harus memakai rekening bank aktif pada Kas Kecil dengan jenis bisnis sumber yang sama.');
   }
   return { account, method, sourceItem };
 }
 
 async function readNagagoldFromEndpoint(branch, from, to) {
+  const source = sourceConfigForBranch(branch);
   const url = new URL(branch.syncUrl);
   url.searchParams.set('from', from.toISOString());
   url.searchParams.set('to', to.toISOString());
-  url.searchParams.set('collection', NAGAGOLD_COLLECTION);
-  url.searchParams.set('limit', String(Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000)));
+  url.searchParams.set('collection', source.collection);
+  url.searchParams.set('limit', String(Number(process.env[source.limitEnv] || process.env.NAGAGOLD_SYNC_LIMIT || 1000)));
   const response = await fetch(url, { headers: { Accept: 'application/json', ...(branch.token ? { Authorization: `Bearer ${branch.token}` } : {}) } });
   if (!response.ok) throw new Error(`Cabang ${branch.kodeToko} mengembalikan HTTP ${response.status}.`);
   const payload = await response.json();
   const items = Array.isArray(payload) ? payload : (payload.items || payload.data || payload.transactions || []);
   if (!Array.isArray(items)) throw new Error(`Respons sync cabang ${branch.kodeToko} tidak memiliki array items/data/transactions.`);
-  return items;
+  return source.code === 'OPTIK' ? items.filter((item) => item.status_valid === true) : items;
 }
 
 async function fetchNagagoldBranch(branch) {
+  const source = sourceConfigForBranch(branch);
   const state = await SyncState.findOneAndUpdate(
-    { sourceSystem: 'nagagold', kodeToko: branch.kodeToko, sourceCollection: NAGAGOLD_COLLECTION },
-    { $setOnInsert: { sourceSystem: 'nagagold', kodeToko: branch.kodeToko, sourceCollection: NAGAGOLD_COLLECTION } },
+    { sourceSystem: source.key, sourceDatabase: branch.databaseName, kodeToko: branch.kodeToko, sourceCollection: source.collection },
+    { $setOnInsert: { sourceSystem: source.key, sourceDatabase: branch.databaseName, kodeToko: branch.kodeToko, sourceCollection: source.collection } },
     { upsert: true, new: true }
   );
   const startedAt = now();
@@ -2495,14 +2927,17 @@ async function fetchNagagoldBranch(branch) {
     const rollingDays = Number(process.env.NAGAGOLD_SYNC_RECONCILE_DAYS || 3);
     const rollingDate = new Date(until.getTime() - rollingDays * 24 * 60 * 60 * 1000);
     const configuredInitialFrom = process.env.NAGAGOLD_SYNC_INITIAL_FROM ? sourceDate(process.env.NAGAGOLD_SYNC_INITIAL_FROM, new Date(Date.now() - initialMinutes * 60 * 1000)) : new Date(Date.now() - initialMinutes * 60 * 1000);
-    const limit = Number(process.env.NAGAGOLD_SYNC_LIMIT || 1000);
-    const importedExists = Boolean(await SyncTransaction.exists({ isImported: true, kodeToko: branch.kodeToko }));
+    const limit = Number(process.env[source.limitEnv] || process.env.NAGAGOLD_SYNC_LIMIT || 1000);
+    const importedExists = Boolean(await SyncTransaction.exists({ sumber: source.code, database_name: branch.databaseName, kode_toko: branch.kodeToko }));
     // Jika seluruh dokumen sinkronisasi hasil uji dihapus, cursor lama tidak
     // boleh membuat worker melewati transaksi sumber. Reset hanya ketika
     // sebelumnya memang pernah mengambil data; state kosong tanpa data sumber
     // tetap tidak dipaksa fetch berulang tanpa batas.
     const resetInitialCursor = !importedExists && (
-      state.initialSyncCompleted !== true || Number(state.lastFetchedCount || 0) > 0
+      state.initialSyncCompleted !== true
+      || Number(state.lastFetchedCount || 0) > 0
+      || Boolean(state.cursorInputDate)
+      || Boolean(state.cursorSourceId)
     );
     const initialSync = state.initialSyncCompleted !== true || resetInitialCursor;
     const afterCursor = initialSync && !resetInitialCursor && state.cursorInputDate
@@ -2511,7 +2946,12 @@ async function fetchNagagoldBranch(branch) {
     const cursorDate = initialSync
       ? (afterCursor?.date ? new Date(afterCursor.date) : configuredInitialFrom)
       : computeSyncWindowStart(state.cursorInputDate, rollingDate, lookbackMinutes, configuredInitialFrom);
-    const items = branch.mongodbUri ? await readNagagoldDirectly(branch, cursorDate, until, afterCursor, { includeBusinessDate: resetInitialCursor }) : await readNagagoldFromEndpoint(branch, cursorDate, until);
+    // `input_date` dapat lebih lama daripada `tanggal` ketika data sumber
+    // dipatch, dipulihkan, atau dibuat ulang. Tetap gunakan cursor input_date
+    // untuk incremental fetch, tetapi sertakan rentang tanggal bisnis yang
+    // terbatas agar transaksi tanggal 3 yang baru masuk tidak terlewat hanya
+    // karena cursor sudah bergerak melewati input_date-nya.
+    const items = branch.mongodbUri ? await readNagagoldDirectly(branch, cursorDate, until, afterCursor, { includeBusinessDate: true }) : await readNagagoldFromEndpoint(branch, cursorDate, until);
     const result = await ingestNagagoldItems(branch, items);
     const reprocessed = await reprocessNagagoldTransactions(branch);
     const latestItem = items[items.length - 1] || null;
@@ -2522,7 +2962,7 @@ async function fetchNagagoldBranch(branch) {
       : new Date(Math.min(until.getTime(), Math.max(previousCursor, latest.getTime())));
     const initialSyncCompleted = initialSync ? items.length < limit : true;
     await SyncState.updateOne({ _id: state._id }, { $set: { cursorInputDate: nextCursor, cursorSourceId: sourceIdOf(latestItem || {}), initialSyncCompleted, lastSuccessAt: now(), lastFetchedAt: now(), lastFetchedCount: items.length, lastInsertedCount: result.inserted, lastUpdatedCount: result.updated, lastError: '' } });
-    return { kodeToko: branch.kodeToko, fetched: items.length, initialSync, initialSyncCompleted, ...result, reprocessed, intervalMinutes };
+    return { kodeToko: branch.kodeToko, sumber: source.code, fetched: items.length, initialSync, initialSyncCompleted, ...result, reprocessed, intervalMinutes };
   } catch (error) {
     await SyncState.updateOne({ _id: state._id }, { $set: { lastError: error.message, lastFetchedAt: now() } });
     throw error;
@@ -2530,7 +2970,7 @@ async function fetchNagagoldBranch(branch) {
 }
 
 async function runNagagoldSync() {
-  if (nagagoldSyncRunning) return { skipped: true, reason: 'Sinkronisasi Nagagold masih berjalan.' };
+  if (nagagoldSyncRunning) return { skipped: true, reason: 'Sinkronisasi transaksi terintegrasi masih berjalan.' };
   nagagoldSyncRunning = true;
   try {
   const branches = await getNagagoldBranches();
@@ -2766,7 +3206,10 @@ function registerMasterOptionRoutes(path, model, entityType, label) {
     const code = String(body.code || body.kodeJenis || body.kode_jenis || '').trim().toUpperCase();
     const name = String(body.name || body.namaJenis || body.nama_jenis || '').trim().toUpperCase();
     const order = Number(body.order ?? body.urutan ?? 0);
-    if (!code || !/^[A-Z][A-Z0-9_]*$/.test(code)) throw new HttpError(422, `Kode ${label} wajib berupa huruf kapital, angka, atau garis bawah.`);
+    // Kode master diisi oleh pengguna, jadi tidak dibatasi hanya huruf,
+    // angka, dan garis bawah. Tetap trim + uppercase untuk menjaga bentuk
+    // pencarian konsisten, serta tetap wajib diisi dan unik.
+    if (!code) throw new HttpError(422, `Kode ${label} wajib diisi.`);
     if (!name) throw new HttpError(422, `Nama ${label} wajib diisi.`);
     const reusable = await model.findOne({ kode_jenis: code, aktif: false });
     if (reusable) {
@@ -2867,7 +3310,7 @@ app.delete('/api/banks/:id', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncR
 }));
 
 app.get('/api/cabang', asyncRoute(async (req, res) => {
-  const branches = await Branch.find({ aktif: { $ne: false } }).sort({ kode_toko: 1 });
+  const branches = await Branch.find({ aktif: { $ne: false } }).sort({ jenis_bisnis: 1, kode_toko: 1 });
   res.json(branches.map(serializeBranch));
 }));
 
@@ -2875,12 +3318,14 @@ app.post('/api/cabang', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(
   const body = req.body || {};
   const kodeToko = String(body.kodeToko || body.kode_toko || '').trim().toUpperCase();
   const namaToko = String(body.namaToko || body.nama_toko || '').trim();
-  const jenisBisnis = String(body.jenisBisnis || body.jenis_bisnis || '').trim().toUpperCase();
+  const jenisBisnis = normalizeSourceBusiness(body.jenisBisnis || body.jenis_bisnis);
   const databaseName = String(body.databaseName || body.database_name || '').trim();
   if (!kodeToko || !namaToko || !databaseName) throw new HttpError(422, 'Kode toko, nama toko, dan nama database wajib diisi.');
   const branchFields = { kode_toko: kodeToko, nama_toko: namaToko.toUpperCase(), jenis_bisnis: jenisBisnis || 'NAGAGOLD', portal: String(body.portal || '').trim(), tipe_toko: String(body.tipeToko || body.tipe_toko || '').trim().toUpperCase(), database_name: databaseName, aktif: body.aktif !== false };
-  const existing = await Branch.findOne({ kode_toko: kodeToko });
+  const existing = await Branch.findOne({ ...branchIdentityQuery({ kodeToko, jenisBisnis }), });
   if (existing?.aktif !== false) throw new HttpError(409, 'Kode toko sudah digunakan.');
+  const databaseConflict = await Branch.findOne({ ...branchBusinessQuery(jenisBisnis), database_name: databaseName, ...(existing ? { _id: { $ne: existing._id } } : {}) });
+  if (databaseConflict) throw new HttpError(409, 'Nama database sudah digunakan oleh cabang pada sumber yang sama.');
   if (existing) {
     const reactivated = await Branch.findByIdAndUpdate(existing._id, { $set: branchFields }, { new: true, runValidators: true });
     await AuditLog.create({ actor: actor(req), action: 'BRANCH_REACTIVATED', entityType: 'BRANCH', entityId: id(reactivated._id), before: serializeBranch(existing), after: serializeBranch(reactivated), correlationId: createNumber('BRANCH') });
@@ -2899,8 +3344,16 @@ app.patch('/api/cabang/:id', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncR
   if (body.portal !== undefined) update.portal = String(body.portal || '').trim();
   if (body.tipeToko !== undefined || body.tipe_toko !== undefined) update.tipe_toko = String(body.tipeToko ?? body.tipe_toko ?? '').trim().toUpperCase();
   if (body.aktif !== undefined) update.aktif = Boolean(body.aktif);
+  const current = await Branch.findById(req.params.id).lean();
+  if (!current) throw new HttpError(404, 'Cabang tidak ditemukan.');
+  const nextBusiness = normalizeSourceBusiness(update.jenis_bisnis ?? current.jenis_bisnis);
+  const nextDatabase = String(update.database_name ?? current.database_name ?? '').trim();
+  const identityConflict = await Branch.findOne({ ...branchIdentityQuery({ kodeToko: current.kode_toko, jenisBisnis: nextBusiness }), _id: { $ne: req.params.id } }).lean();
+  if (identityConflict) throw new HttpError(409, 'Kode toko sudah digunakan pada sumber bisnis tersebut.');
+  const databaseConflict = await Branch.findOne({ ...branchBusinessQuery(nextBusiness), database_name: nextDatabase, _id: { $ne: req.params.id } }).lean();
+  if (databaseConflict) throw new HttpError(409, 'Nama database sudah digunakan oleh cabang pada sumber yang sama.');
+  if (update.jenis_bisnis !== undefined) update.jenis_bisnis = nextBusiness;
   const branch = await Branch.findByIdAndUpdate(req.params.id, { $set: update }, { new: true, runValidators: true });
-  if (!branch) throw new HttpError(404, 'Cabang tidak ditemukan.');
   res.json(serializeBranch(branch));
 }));
 
@@ -2960,7 +3413,10 @@ async function resolveAccountInput(body, existing = null) {
   let branch = null;
   if (lokasi === 'TOKO_CABANG') {
     if (requestedBranchId && mongoose.isValidObjectId(requestedBranchId)) branch = await Branch.findOne({ _id: requestedBranchId, aktif: true });
-    if (!branch && requestedBranchCode) branch = await Branch.findOne({ kode_toko: requestedBranchCode, aktif: true });
+    if (!branch && requestedBranchCode) {
+      const branchBusiness = ['NAGAGOLD', 'OPTIK'].includes(unit) ? unit : 'NAGAGOLD';
+      branch = await Branch.findOne({ ...branchIdentityQuery({ kodeToko: requestedBranchCode, jenisBisnis: branchBusiness }), aktif: true });
+    }
     if (!branch) throw new HttpError(422, 'Toko/cabang wajib dipilih untuk lokasi TOKO/CABANG.');
   }
   const kodeToko = branch?.kode_toko || '';
@@ -3109,7 +3565,7 @@ app.post('/api/requests', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (
   const requestId = body.requestId || body.request_id;
   const asalPermintaan = String(body.asalPermintaan || body.asal_permintaan || (body.kodeToko || body.kode_toko ? 'CABANG' : 'INTERNAL')).trim().toUpperCase();
   if (!['CABANG', 'INTERNAL'].includes(asalPermintaan)) throw new HttpError(422, 'Asal permintaan harus CABANG atau INTERNAL.');
-  const sourceSystem = body.sourceSystem || body.source_system || (asalPermintaan === 'CABANG' ? 'nagagold' : 'finance');
+  const sourceSystem = String(body.sourceSystem || body.source_system || (asalPermintaan === 'INTERNAL' ? 'finance' : '')).trim().toLowerCase();
   const jenisTransaksi = body.jenisTransaksi || body.jenis_transaksi || body.jenisRequest || body.jenis_request || body.requestType || body.request_type;
   const kodeToko = String(body.kodeToko || body.kode_toko || '').trim().toUpperCase();
   const unitPemohon = String(body.unitPemohon || body.unit_pemohon || '').trim().toUpperCase();
@@ -3120,25 +3576,46 @@ app.post('/api/requests', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (
   const nilaiRp = body.nilaiRp ?? body.nilai_rp;
   const requestedAt = body.requestedAt || body.requested_at;
   const tujuan = body.tujuan || '';
-  const namaToko = body.namaToko || body.nama_toko || '';
+  let namaToko = body.namaToko || body.nama_toko || '';
+  let sourceBranch = null;
   if (!noRekening && destinationAccountId && mongoose.isValidObjectId(destinationAccountId)) {
     const destinationAccount = await Account.findOne({ _id: destinationAccountId, aktif: true }).select('nomor_rekening kode_akun').lean();
     noRekening = String(destinationAccount?.nomor_rekening || destinationAccount?.kode_akun || '').trim().toUpperCase();
   }
-  if (!sourceSystem || !jenisTransaksi || !noRekening || !Number(nilaiRp) || !requestedAt) throw new HttpError(422, 'request_id, jenis_transaksi, no_rekening, nilai_rp, dan requested_at wajib diisi.');
+  if (!sourceSystem || !jenisTransaksi || !noRekening || !Number(nilaiRp) || !requestedAt) throw new HttpError(422, 'request_id, source_system, jenis_transaksi, no_rekening, nilai_rp, dan requested_at wajib diisi.');
   const normalizedRequestId = String(requestId || '').trim().toUpperCase() || await nextRequestNumber(String(requestedAt).slice(0, 10));
   if (!/^RQS-\d{8}-\d{4,}$/.test(normalizedRequestId)) throw new HttpError(422, 'request_id harus menggunakan format RQS-YYYYMMDD-NOMOR_URUT, contoh RQS-20261102-0001.');
   if (asalPermintaan === 'CABANG' && !kodeToko) throw new HttpError(422, 'Kode toko wajib diisi untuk permintaan dari cabang.');
+  if (asalPermintaan === 'CABANG' && !['nagagold', 'optik'].includes(sourceSystem)) throw new HttpError(422, 'source_system cabang harus nagagold atau optik.');
+  if (asalPermintaan === 'CABANG') {
+    sourceBranch = await Branch.findOne({ kode_toko: kodeToko, jenis_bisnis: sourceSystem.toUpperCase(), aktif: { $ne: false } }).lean();
+    if (!sourceBranch) throw new HttpError(422, `Cabang ${kodeToko} tidak ditemukan pada sumber ${sourceSystem.toUpperCase()}.`);
+    namaToko = sourceBranch.nama_toko;
+  }
   if (asalPermintaan === 'INTERNAL' && !unitPemohon && !namaPemohon) throw new HttpError(422, 'Unit atau nama pemohon internal wajib diisi.');
+  let destinationAccount = null;
   for (const [label, accountId] of [['sumber', sourceAccountId], ['tujuan', destinationAccountId]]) {
     if (!accountId) continue;
-    if (!mongoose.isValidObjectId(accountId) || !await Account.exists({ _id: accountId, aktif: true })) throw new HttpError(422, `Rekening ${label} pada permintaan dana tidak ditemukan atau tidak aktif.`);
+    if (!mongoose.isValidObjectId(accountId)) throw new HttpError(422, `Rekening ${label} pada permintaan dana tidak ditemukan atau tidak aktif.`);
+    const account = await Account.findOne({ _id: accountId, aktif: true }).select('kelompok_rekening unit').lean();
+    if (!account) throw new HttpError(422, `Rekening ${label} pada permintaan dana tidak ditemukan atau tidak aktif.`);
+    if (label === 'tujuan') destinationAccount = account;
+  }
+  if (destinationAccount) {
+    const expectedCashType = asalPermintaan === 'CABANG' ? 'KAS_KECIL' : 'KAS_BESAR';
+    if (String(destinationAccount.kelompok_rekening || '').toUpperCase() !== expectedCashType) {
+      throw new HttpError(422, `Rekening tujuan permintaan ${asalPermintaan === 'CABANG' ? 'cabang harus berada pada Kas Kecil.' : 'internal harus berada pada Kas Besar.'}`);
+    }
+    const expectedBusiness = asalPermintaan === 'CABANG' ? sourceSystem.toUpperCase() : unitPemohon;
+    if (expectedBusiness && String(destinationAccount.unit || '').toUpperCase() !== expectedBusiness) {
+      throw new HttpError(422, 'Jenis bisnis rekening tujuan tidak sesuai dengan permintaan.');
+    }
   }
   const duplicate = await TransferRequest.findOne({ sourceSystem: String(sourceSystem).toLowerCase(), requestId: normalizedRequestId });
   if (duplicate) return res.status(200).json(serializeRequest(duplicate));
   const normalizedJenisTransaksi = String(jenisTransaksi).trim().toUpperCase();
   if (!await TransactionType.exists({ kode_jenis: normalizedJenisTransaksi, aktif: true })) throw new HttpError(422, 'Jenis transaksi belum terdaftar atau sudah nonaktif di Master Jenis Transaksi.');
-  const request = await TransferRequest.create({ requestId: normalizedRequestId, sourceSystem, asal_permintaan: asalPermintaan, unit_pemohon: unitPemohon, nama_pemohon: namaPemohon, source_account_id: sourceAccountId, destination_account_id: destinationAccountId, jenisRequest: normalizedJenisTransaksi, kodeToko, namaTokoSnapshot: String(namaToko).trim().toUpperCase(), sourceBranchId: body.sourceBranchId || body.source_branch_id || '', noRekening, nilaiRp: Number(nilaiRp), requestedAt: new Date(requestedAt), tujuan: String(tujuan).trim().toUpperCase(), created_by: actor(req), status: 'REQUESTED', approval_status: APPROVAL_STATUSES.NOT_STARTED, payment_status: PAYMENT_STATUSES.WAITING_TRANSFER, rawReference: body.rawReference || body.raw_reference || null });
+  const request = await TransferRequest.create({ requestId: normalizedRequestId, sourceSystem, asal_permintaan: asalPermintaan, unit_pemohon: unitPemohon, nama_pemohon: namaPemohon, source_account_id: sourceAccountId, destination_account_id: destinationAccountId, jenisRequest: normalizedJenisTransaksi, kodeToko, namaTokoSnapshot: String(namaToko).trim().toUpperCase(), sourceBranchId: sourceBranch ? id(sourceBranch._id) : (body.sourceBranchId || body.source_branch_id || ''), noRekening, nilaiRp: Number(nilaiRp), requestedAt: new Date(requestedAt), tujuan: String(tujuan).trim().toUpperCase(), created_by: actor(req), status: 'REQUESTED', approval_status: APPROVAL_STATUSES.NOT_STARTED, payment_status: PAYMENT_STATUSES.WAITING_TRANSFER, rawReference: body.rawReference || body.raw_reference || null });
   const pemohonLabel = asalPermintaan === 'CABANG' ? kodeToko : (namaPemohon || unitPemohon || 'INTERNAL FINANCE');
   await Notification.create({ type: 'BRANCH_REQUEST', title: 'Permintaan dana baru', message: `${request.requestId} dari ${pemohonLabel} membutuhkan ${request.nilaiRp}.`, referenceType: 'TRANSFER_REQUEST', referenceId: id(request._id) });
   res.status(201).json(serializeRequest(request));
@@ -3205,7 +3682,10 @@ async function rejectRequestBeforeTransfer(requestId, req) {
 }
 
 async function recordRequestPayment(requestId, body, req) {
-  const transferDate = String(body.transferDate || body.transfer_date || body.transactionDate || today()).slice(0, 10);
+  // Realisasi mutasi selalu memakai tanggal sistem saat dicatat. Tanggal dari
+  // client tidak dipercaya agar user tidak dapat backdate atau membuat saldo
+  // masuk ke periode yang belum berjalan.
+  const transferDate = today();
   const transferReference = String(body.transferReference || body.transfer_reference || body.paymentReference || body.payment_reference || '').trim();
   const transferProof = String(body.transferProof || body.transfer_proof || body.paymentProof || body.payment_proof || '').trim();
   const paymentNote = String(body.paymentNote || body.payment_note || body.note || '').trim().toUpperCase();
@@ -3369,54 +3849,95 @@ app.get('/api/nagagold-mapping', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), as
   const transactionQuery = nagagoldTransactionQuery();
   if (req.query.kodeToko) transactionQuery.kodeToko = String(req.query.kodeToko).toUpperCase();
   const [mappings, transactions, accounts] = await Promise.all([
-    NagagoldAccountMapping.find({ source_system: 'nagagold', ...(req.query.kodeToko ? { kode_toko: String(req.query.kodeToko).toUpperCase() } : {}) }).sort({ kode_toko: 1, metode_pembayaran: 1, nomor_rekening: 1 }),
+    NagagoldAccountMapping.find({ source_system: { $in: ['nagagold', 'optik'] } }).sort({ unit: 1, nomor_rekening: 1 }),
     SyncTransaction.find(transactionQuery).sort({ transactionDate: -1, createdAt: -1 }).lean(),
     Account.find({}).select('_id nama_rekening').lean(),
   ]);
   const accountsById = new Map(accounts.map((account) => [id(account._id), account.nama_rekening]));
   const failedExamples = transactions.filter((transaction) => transaction.mappingStatus !== 'TERPETAKAN').slice(0, 100).map((transaction) => ({
     id: id(transaction._id), transactionNumber: transaction.transactionNumber, kodeToko: transaction.kodeToko,
+    jenisBisnis: String(transaction.sumber || transaction.jenis_bisnis || 'NAGAGOLD').toUpperCase(),
     sourceId: transaction.source_transaction_id || transaction.sourceId || '',
     metodePembayaran: transaction.source_payment_method || sourcePaymentMethod(transaction),
     sourceNoRekening: transaction.sourceNoRekening || '', sourceKodeBank: transaction.sourceKodeBank || '',
     mappingStatus: transaction.mappingStatus || 'PERLU_PEMETAAN', mappingReason: transaction.mappingReason || transaction.sync_message || '',
     mappingCandidateIds: transaction.mappingCandidateIds || [], sourceDecryptionStatus: transaction.sourceDecryptionStatus || 'UNKNOWN', sourceFinalityStatus: transaction.sourceFinalityStatus || 'UNVERIFIED',
   }));
-  res.json({ mappings: mappings.map((mapping) => serializeNagagoldMapping(mapping, accountsById)), summary: nagagoldMappingSummary(transactions), failedExamples });
+  const sourceAccountsByKey = new Map();
+  for (const transaction of transactions) {
+    const unit = String(transaction.sumber || transaction.jenis_bisnis || 'NAGAGOLD').trim().toUpperCase();
+    const rawNumber = normalizeNagagoldValue(transaction.source_no_rekening || transaction.sourceNoRekening || '');
+    const storedMethod = String(transaction.jenis_pembayaran || transaction.source_payment_method || '').trim().toUpperCase();
+    const method = storedMethod || sourcePaymentMethod({ ...transaction, no_rekening: rawNumber });
+    const isCash = method === 'CASH' || !rawNumber;
+    const bank = isCash ? '' : normalizeNagagoldValue(transaction.source_kode_bank || transaction.sourceKodeBank || '').toUpperCase();
+    const number = isCash ? '' : rawNumber;
+    const key = [unit, number].join('::');
+    const current = sourceAccountsByKey.get(key) || {
+      id: key,
+      jenisBisnis: unit,
+      sourceSystem: unit.toLowerCase(),
+      metodePembayaran: isCash ? 'CASH' : method,
+      kodeBank: bank,
+      nomorRekening: number,
+      cabangKode: new Set(),
+      jumlahTransaksi: 0,
+    };
+    current.jumlahTransaksi += 1;
+    if (transaction.kode_toko) current.cabangKode.add(String(transaction.kode_toko).toUpperCase());
+    sourceAccountsByKey.set(key, current);
+  }
+  const sourceAccounts = [...sourceAccountsByKey.values()]
+    .map((item) => ({
+      ...item,
+      cabangCount: item.cabangKode.size,
+      cabangKode: [...item.cabangKode],
+      label: item.metodePembayaran === 'CASH'
+        ? `${item.jenisBisnis} · KAS TUNAI`
+        : `${item.jenisBisnis} · ${item.nomorRekening}`,
+    }))
+    .sort((a, b) => `${a.jenisBisnis}${a.kodeBank}${a.nomorRekening}`.localeCompare(`${b.jenisBisnis}${b.kodeBank}${b.nomorRekening}`));
+  res.json({ mappings: mappings.map((mapping) => serializeNagagoldMapping(mapping, accountsById)), summary: nagagoldMappingSummary(transactions), failedExamples, sourceAccounts });
 }));
 
 async function previewNagagoldMappingConfigurations(filters = {}) {
   const query = nagagoldTransactionQuery();
+  const jenisBisnis = normalizeSourceBusiness(filters.jenisBisnis || filters.jenis_bisnis || filters.sourceSystem || filters.source_system, '');
   const kodeToko = String(filters.kodeToko || filters.kode_toko || '').trim().toUpperCase();
   const metode = String(filters.metodePembayaran || filters.metode_pembayaran || '').trim().toUpperCase();
   const kodeBank = String(filters.kodeBank || filters.kode_bank || '').trim().toUpperCase();
   const nomorRekening = String(filters.nomorRekening || filters.nomor_rekening || '').trim();
   if (kodeToko) query.kodeToko = kodeToko;
-  if (metode) query.source_payment_method = metode;
-  if (kodeBank) query.sourceKodeBank = kodeBank;
-  if (nomorRekening) query.sourceNoRekening = nomorRekening;
+  if (jenisBisnis) query.sumber = jenisBisnis;
+  if (metode) query.jenis_pembayaran = metode;
+  if (kodeBank) query.kode_bank = kodeBank;
+  if (nomorRekening) query.no_rekening = nomorRekening;
   const limit = Math.min(50000, Math.max(1, Number(filters.limit || 10000)));
   const transactions = await SyncTransaction.find(query).sort({ transactionDate: -1, createdAt: -1 }).limit(limit).lean();
   const grouped = new Map();
   for (const transaction of transactions) {
+    const rawNumber = normalizeNagagoldValue(transaction.source_no_rekening || transaction.sourceNoRekening || '');
     const method = sourcePaymentMethod({
       source_payment_method: transaction.source_payment_method,
+      jenis_pembayaran: transaction.jenis_pembayaran,
       jenis: transaction.jenisSumber,
-      no_rekening: transaction.sourceNoRekening,
+      no_rekening: rawNumber,
     });
     const branchCode = String(transaction.kodeToko || '').trim().toUpperCase();
-    const unit = String(transaction.jenis_bisnis || transaction.jenisBisnis || 'NAGAGOLD').trim().toUpperCase();
-    const bank = String(transaction.sourceKodeBank || '').trim().toUpperCase();
-    const accountNumber = String(transaction.sourceNoRekening || '').trim();
+    const unit = String(transaction.sumber || transaction.jenis_bisnis || transaction.jenisBisnis || 'NAGAGOLD').trim().toUpperCase();
+    const bank = normalizeNagagoldValue(transaction.source_kode_bank || transaction.sourceKodeBank || '').toUpperCase();
+    const accountNumber = rawNumber;
     const isCash = method === 'CASH' || accountNumber === '-';
-    const mappingBranchCode = isCash ? '*' : branchCode;
-    const key = [mappingBranchCode, unit, method, bank, isCash ? '' : accountNumber].join('::');
+    const mappingAccountNumber = isCash ? '' : accountNumber;
+    const key = [unit, mappingAccountNumber].join('::');
     const current = grouped.get(key) || {
-      key, unit, kodeToko: branchCode, mappingKodeToko: mappingBranchCode, metodePembayaran: method,
-      kodeBank: bank, nomorRekening: accountNumber, jumlahTransaksi: 0,
+      key, unit, kodeToko: branchCode, mappingKodeToko: '*', metodePembayaran: method,
+      kodeBank: bank, nomorRekening: isCash ? '' : accountNumber, cabangCount: 0, cabangKode: new Set(), jumlahTransaksi: 0,
       totalMasuk: 0, totalKeluar: 0, statusSumber: new Set(), mappingStatus: new Set(), transactionIds: [],
     };
     current.jumlahTransaksi += 1;
+    if (branchCode) current.cabangKode.add(branchCode);
+    current.cabangCount = current.cabangKode.size;
     current.totalMasuk += transaction.arahDana === 'MASUK' ? Number(transaction.amount || 0) : 0;
     current.totalKeluar += transaction.arahDana === 'KELUAR' ? Number(transaction.amount || 0) : 0;
     if (transaction.statusSumber) current.statusSumber.add(transaction.statusSumber);
@@ -3429,9 +3950,9 @@ async function previewNagagoldMappingConfigurations(filters = {}) {
   const bankIds = [...new Set(accountCandidates.map((account) => id(account.bank_id)).filter(Boolean))];
   const banks = await Bank.find({ _id: { $in: bankIds } }).lean();
   const bankCodeById = new Map(banks.map((bank) => [id(bank._id), bank.kode_bank]));
-  const mappings = await NagagoldAccountMapping.find({ source_system: 'nagagold', aktif: true }).lean();
+  const mappings = await NagagoldAccountMapping.find({ source_system: { $in: ['nagagold', 'optik'] }, aktif: true }).lean();
   const mappingByKey = new Map(mappings.map((mapping) => [
-    [mapping.kode_toko, mapping.unit, mapping.metode_pembayaran, mapping.kode_bank || '', mapping.nomor_rekening || ''].join('::'), mapping,
+    [mapping.unit, mapping.nomor_rekening || ''].join('::'), mapping,
   ]));
 
   const rows = [...grouped.values()].map((group) => {
@@ -3440,13 +3961,18 @@ async function previewNagagoldMappingConfigurations(filters = {}) {
       if (account.unit !== group.unit) return false;
       if (isCash) return account.bentuk_saldo === 'KAS_TUNAI';
       if (account.bentuk_saldo !== 'REKENING_BANK' || account.nomor_rekening !== group.nomorRekening) return false;
-      return !group.kodeBank || bankCodeById.get(id(account.bank_id)) === group.kodeBank;
+      if (account.unit && account.unit !== group.unit) return false;
+      return true;
     }).map((account) => ({ id: id(account._id), name: account.nama_rekening, jenisAkun: inferAccountKind(account), nomorRekening: account.nomor_rekening || '', kodeToko: account.kode_toko || '', kodeBank: bankCodeById.get(id(account.bank_id)) || '' }));
-    const configured = mappingByKey.get([group.mappingKodeToko, group.unit, group.metodePembayaran, group.kodeBank, isCash ? '' : group.nomorRekening].join('::')) || null;
+    // Mapping sekarang tidak lagi dibedakan per cabang atau metode pembayaran.
+    // Satu rekening sumber dalam satu jenis bisnis harus menunjuk ke satu
+    // rekening Finance yang sama, sehingga lookup preview harus memakai kunci
+    // yang sama dengan resolver dan unique index.
+    const configured = mappingByKey.get([group.unit, isCash ? '' : group.nomorRekening].join('::')) || null;
     const configuredCandidate = configured ? candidates.find((candidate) => candidate.id === id(configured.rekening_id)) : null;
     let hasil = 'BELUM_ADA_KANDIDAT';
     let alasan = 'Belum ada rekening Finance yang cocok dengan konteks sumber.';
-    if (configured && configuredCandidate) { hasil = 'TERPETAKAN_KONFIGURASI'; alasan = 'Mapping aktif ditemukan untuk konteks cabang dan metode ini.'; }
+    if (configured && configuredCandidate) { hasil = 'TERPETAKAN_KONFIGURASI'; alasan = 'Mapping aktif ditemukan untuk jenis bisnis dan rekening sumber ini.'; }
     else if (configured && !configuredCandidate) { hasil = 'KONFIGURASI_TIDAK_VALID'; alasan = 'Mapping aktif menunjuk rekening yang tidak lagi menjadi kandidat valid.'; }
     else if (candidates.length === 1) { hasil = 'KANDIDAT_UNIK'; alasan = 'Satu rekening Finance cocok, tetapi belum disimpan sebagai konfigurasi mapping.'; }
     else if (candidates.length > 1) { hasil = 'AMBIGU'; alasan = 'Lebih dari satu rekening Finance cocok; Admin harus memilih secara eksplisit.'; }
@@ -3457,7 +3983,7 @@ async function previewNagagoldMappingConfigurations(filters = {}) {
       hasil, alasan,
     };
   }).sort((a, b) => b.jumlahTransaksi - a.jumlahTransaksi);
-  return { previewOnly: true, writesPerformed: false, filter: { kodeToko, metodePembayaran: metode, kodeBank, nomorRekening, limit }, sourceTransactionCount: transactions.length, configurationCount: rows.length, rows };
+  return { previewOnly: true, writesPerformed: false, filter: { jenisBisnis, kodeToko, metodePembayaran: metode, kodeBank, nomorRekening, limit }, sourceTransactionCount: transactions.length, configurationCount: rows.length, rows };
 }
 
 app.post('/api/nagagold-mapping/bulk-preview', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
@@ -3465,21 +3991,26 @@ app.post('/api/nagagold-mapping/bulk-preview', requireRole('ADMIN', 'OWNER', 'SU
 }));
 
 app.post('/api/nagagold-mapping/test', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
-  const branch = await mappingBranch(req.body?.kodeToko);
+  const branch = mappingBusiness(req.body?.jenisBisnis || req.body?.jenis_bisnis || req.body?.sourceSystem || req.body?.source_system);
   const sourceItem = mappingSourceItem(req.body || {});
   const result = await resolveNagagoldAccount(sourceItem, branch);
-  res.json({ kodeToko: branch.kodeToko, metodePembayaran: sourcePaymentMethod(sourceItem), status: result.status, reason: result.reason, candidateIds: result.candidateIds, rekening: result.account ? serializeAccount(result.account) : null, ruleKey: result.ruleKey });
+  res.json({ jenisBisnis: branch.jenisBisnis, metodePembayaran: sourcePaymentMethod(sourceItem), status: result.status, reason: result.reason, candidateIds: result.candidateIds, rekening: result.account ? serializeAccount(result.account) : null, ruleKey: result.ruleKey });
 }));
 
 app.post('/api/nagagold-mapping', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
   const body = req.body || {};
-  const branch = await mappingBranch(body.kodeToko || body.kode_toko);
+  const branch = mappingBusiness(body.jenisBisnis || body.jenis_bisnis || body.sourceSystem || body.source_system);
   const { account, method } = await validateNagagoldMappingAccount({ branch, body });
   const cash = method === 'CASH';
-  const context = { source_system: 'nagagold', kode_toko: cash ? '*' : branch.kodeToko, unit: branch.unit, metode_pembayaran: method, kode_bank: cash ? '' : String(body.kodeBank || body.kode_bank || '').trim().toUpperCase(), nomor_rekening: cash ? '' : String(body.nomorRekening || body.nomor_rekening || '').trim() };
-  const mapping = await NagagoldAccountMapping.findOneAndUpdate(context, { $set: { ...context, jenis_akun: inferAccountKind(account), rekening_id: account._id, aktif: body.aktif !== false, keterangan: String(body.keterangan || '').trim().toUpperCase(), updated_by: actor(req) }, $setOnInsert: { created_by: actor(req) } }, { upsert: true, new: true, runValidators: true });
-  await AuditLog.create({ actor: actor(req), action: 'NAGAGOLD_MAPPING_SAVED', entityType: 'NAGAGOLD_ACCOUNT_MAPPING', entityId: id(mapping._id), after: { kodeToko: context.kode_toko, unit: context.unit, sourceBranch: branch.kodeToko, metodePembayaran: method, rekeningId: id(account._id) }, correlationId: createNumber('MAP') });
-  res.status(200).json(serializeNagagoldMapping(mapping, new Map([[id(account._id), account.nama_rekening]])));
+  const context = { source_system: branch.sourceSystem, kode_toko: '*', unit: branch.unit, metode_pembayaran: method, kode_bank: cash ? '' : String(body.kodeBank || body.kode_bank || '').trim().toUpperCase(), nomor_rekening: cash ? '' : normalizeNagagoldValue(body.nomorRekening || body.nomor_rekening) };
+  const mapping = await NagagoldAccountMapping.findOneAndUpdate(
+    { source_system: context.source_system, unit: context.unit, nomor_rekening: context.nomor_rekening },
+    { $set: { ...context, jenis_akun: inferAccountKind(account), rekening_id: account._id, aktif: body.aktif !== false, keterangan: String(body.keterangan || '').trim().toUpperCase(), updated_by: actor(req) }, $setOnInsert: { created_by: actor(req) } },
+    { upsert: true, new: true, runValidators: true },
+  );
+  const reprocess = await reprocessNagagoldTransactionsForBusiness(branch.unit);
+  await AuditLog.create({ actor: actor(req), action: 'NAGAGOLD_MAPPING_SAVED', entityType: 'NAGAGOLD_ACCOUNT_MAPPING', entityId: id(mapping._id), after: { unit: context.unit, metodePembayaran: method, rekeningId: id(account._id), reprocess }, correlationId: createNumber('MAP') });
+  res.status(200).json({ ...serializeNagagoldMapping(mapping, new Map([[id(account._id), account.nama_rekening]])), reprocess });
 }));
 
 app.get('/api/nagagold-auto-posting/rules', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
@@ -3648,6 +4179,7 @@ async function processManualJournalDecision(journalId, action, reason, req, sess
       noTransaksi: journal.no_transaksi,
       tanggal: today(),
       tipe: 'PEMBALIKAN',
+      sumber: journalSourceForTransaction(journal),
       status: 'POSTED',
       createdBy: actor(req),
       entry: {
@@ -3708,7 +4240,7 @@ app.post('/api/manual-transactions', requireRole('ADMIN', 'SUPER_USER'), asyncRo
     const account = await accountById(rekeningId, session);
     const [entry] = await financeEntries([{ rekeningId: account._id, debet: arahDana === 'MASUK' ? amount : 0, kredit: arahDana === 'KELUAR' ? amount : 0, jenis_transaksi: jenisTransaksi, keterangan: note }], session);
     const [journal] = await JournalEntry.create([{
-      ...financePayload({ noKeuangan: await nextFinanceNumber(tanggal, session), noTransaksi: await nextManualTransactionNumber(tanggal, session), tanggal, tipe: 'PENYESUAIAN_SALDO', jenisTransaksi, status: 'PROVISIONAL', createdBy: actor(req), entry }),
+      ...financePayload({ noKeuangan: await nextFinanceNumber(tanggal, session), noTransaksi: await nextManualTransactionNumber(tanggal, session), tanggal, tipe: 'PENYESUAIAN_SALDO', jenisTransaksi, sumber: 'FINANCE', status: 'PROVISIONAL', createdBy: actor(req), entry }),
     }], { session });
     await markBalanceSnapshotsStale([journal.rekening_id], tanggal, session);
     const accountUpdate = await Account.updateOne({ _id: account._id, aktif: true }, { $inc: { saldo_akhir: arahDana === 'MASUK' ? amount : -amount } }, { session });
@@ -3741,8 +4273,8 @@ app.get('/api/nagagold-rekening', asyncRoute(async (req, res) => {
     getNagagoldBranches(),
     Account.find({ aktif: true }).select('nama_rekening nomor_rekening kelompok_rekening unit').lean(),
     SyncTransaction.aggregate([
-      { $match: nagagoldTransactionQuery({ sourceNoRekening: { $nin: ['', '-'] } }) },
-      { $group: { _id: { nomor: '$sourceNoRekening', bank: '$sourceKodeBank' }, cabang: { $addToSet: '$kodeToko' }, jumlahTransaksi: { $sum: 1 }, totalMasuk: { $sum: { $cond: [{ $eq: ['$arahDana', 'MASUK'] }, '$amount', 0] } }, totalKeluar: { $sum: { $cond: [{ $eq: ['$arahDana', 'KELUAR'] }, '$amount', 0] } } } },
+      { $match: nagagoldTransactionQuery({ source_no_rekening: { $nin: ['', '-'] } }) },
+      { $group: { _id: { nomor: '$source_no_rekening', bank: '$source_kode_bank' }, cabang: { $addToSet: '$kode_toko' }, jumlahTransaksi: { $sum: 1 }, totalMasuk: { $sum: '$jumlah_in' }, totalKeluar: { $sum: '$jumlah_out' } } },
     ]),
   ]);
   const sourceAccounts = [];
@@ -3774,7 +4306,7 @@ app.get('/api/nagagold-rekening', asyncRoute(async (req, res) => {
 }));
 
 app.get('/api/sinkronisasi/nagagold/status', asyncRoute(async (req, res) => {
-  const states = await SyncState.find({ sourceSystem: 'nagagold', sourceCollection: NAGAGOLD_COLLECTION }).sort({ kodeToko: 1 });
+  const states = await SyncState.find({ sourceSystem: { $in: ['nagagold', 'optik'] }, sourceCollection: NAGAGOLD_COLLECTION }).sort({ sourceSystem: 1, kodeToko: 1 });
   res.json(states.map(serializeSyncState));
 }));
 
@@ -3966,7 +4498,8 @@ app.post('/api/transactions', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(asy
     const result = await recordRequestPayment(request._id, body, req);
     return res.status(result.idempotent ? 200 : 201).json(serializeTransaction(result.transaction, await resolveAccountsMap()));
   }
-  if (!body.transactionDate || !body.jenisTransaksi || (!directMutation && !body.jenisRequest) || !body.sourceAccountId || !body.destinationAccountId || !Number(body.amount)) throw new HttpError(422, 'Tanggal, jenis transaksi, akun sumber, akun tujuan, dan nominal wajib diisi.');
+  if (!body.jenisTransaksi || (!directMutation && !body.jenisRequest) || !body.sourceAccountId || !body.destinationAccountId || !Number(body.amount)) throw new HttpError(422, 'Jenis transaksi, akun sumber, akun tujuan, dan nominal wajib diisi.');
+  const transactionDate = today();
   const normalizedJenisTransaksi = String(body.jenisTransaksi).trim().toUpperCase();
   const normalizedJenisRequest = String(body.jenisRequest || (directMutation ? 'MUTASI_REKENING' : '')).trim().toUpperCase();
   if (!await TransactionType.exists({ kode_jenis: normalizedJenisTransaksi, aktif: true })) throw new HttpError(422, 'Jenis transaksi belum terdaftar atau sudah nonaktif di Master Jenis Transaksi.');
@@ -3980,7 +4513,7 @@ app.post('/api/transactions', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(asy
   const destinationSnapshot = mutationAccountSnapshot(accounts[1]);
   const transaction = await withMongoTransaction(async (session) => {
     const created = await FinanceMutation.create([{
-      transactionNumber: await nextMutationNumber(body.transactionDate, session), bentukTransaksi: 'TRANSFER_INTERNAL', kategori_sistem: 'MUTASI', requestId: '', transactionDate: body.transactionDate, jenisTransaksi: normalizedJenisTransaksi, jenisRequest: normalizedJenisRequest, arahDana: String(body.arahDana || 'KELUAR').trim().toUpperCase(), kodeToko: String(body.kodeToko || '').trim().toUpperCase(), namaTokoSnapshot: String(body.namaToko || '').trim().toUpperCase(), sourceAccountId: accounts[0]._id, destinationAccountId: accounts[1]._id, bank_asal: sourceSnapshot.bank, bank_tujuan: destinationSnapshot.bank, jenis_kas_asal: sourceSnapshot.cashType, jenis_kas_tujuan: destinationSnapshot.cashType, amount: Number(body.amount), status: 'PENDING_APPROVAL', statusValid: false, note: String(body.note || '').trim().toUpperCase() || '-', created_by: actor(req), source_type: SOURCE_TYPES.MANUAL_ADMIN, sync_status: SYNC_STATUSES.NOT_APPLICABLE, sync_message: '', approval_status: APPROVAL_STATUSES.PENDING, payment_status: PAYMENT_STATUSES.NOT_APPLICABLE, journal_status: JOURNAL_STATUSES.PROVISIONAL, source_payment_method: directMutation ? 'INTERNAL' : 'BANK', source_transaction_id: '', finance_transaction_id: '',
+      transactionNumber: await nextMutationNumber(transactionDate, session), bentukTransaksi: 'TRANSFER_INTERNAL', kategori_sistem: 'MUTASI', requestId: '', transactionDate, jenisTransaksi: normalizedJenisTransaksi, jenisRequest: normalizedJenisRequest, arahDana: String(body.arahDana || 'KELUAR').trim().toUpperCase(), kodeToko: String(body.kodeToko || '').trim().toUpperCase(), namaTokoSnapshot: String(body.namaToko || '').trim().toUpperCase(), sourceAccountId: accounts[0]._id, destinationAccountId: accounts[1]._id, bank_asal: sourceSnapshot.bank, bank_tujuan: destinationSnapshot.bank, jenis_kas_asal: sourceSnapshot.cashType, jenis_kas_tujuan: destinationSnapshot.cashType, amount: Number(body.amount), status: 'PENDING_APPROVAL', statusValid: false, note: String(body.note || '').trim().toUpperCase() || '-', created_by: actor(req), source_type: SOURCE_TYPES.MANUAL_ADMIN, sync_status: SYNC_STATUSES.NOT_APPLICABLE, sync_message: '', approval_status: APPROVAL_STATUSES.PENDING, payment_status: PAYMENT_STATUSES.NOT_APPLICABLE, journal_status: JOURNAL_STATUSES.PROVISIONAL, source_payment_method: directMutation ? 'INTERNAL' : 'BANK', source_transaction_id: '', finance_transaction_id: '',
     }], { session });
     const item = created[0];
     await ensureInitialJournal(item, session);
@@ -4341,7 +4874,7 @@ app.get('/api/reports/journals', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), re
 app.get('/api/reports/reconciliation', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), reportHandler(reportReconciliation));
 
 function exportTitle(report) {
-  return ({ financial: 'Laporan Kas & Bank', balances: 'Saldo Kas dan Rekening', transactions: 'Semua Transaksi Finance', integrated: 'Transaksi Terintegrasi Nagagold', 'nagagold-source': 'Pergerakan Sumber Nagagold', 'nagagold-cash': 'Laporan Cash Nagagold', 'nagagold-accounts': 'Laporan Rekening Nagagold', mutations: 'Mutasi Antar Kas', requests: 'Request dan Approval', journals: 'Jurnal dan Buku Besar', reconciliation: 'Rekonsiliasi Nagagold' }[report] || 'Laporan Finance');
+  return ({ financial: 'Laporan Kas & Bank', balances: 'Saldo Kas dan Rekening', transactions: 'Semua Transaksi Finance', integrated: 'Transaksi Terintegrasi Sumber', 'nagagold-source': 'Pergerakan Sumber', 'nagagold-cash': 'Laporan Cash Sumber', 'nagagold-accounts': 'Laporan Rekening Sumber', mutations: 'Mutasi Antar Kas', requests: 'Request dan Approval', journals: 'Jurnal dan Buku Besar', reconciliation: 'Rekonsiliasi Sumber' }[report] || 'Laporan Finance');
 }
 
 async function loadReportForExport(report, query) {
@@ -4380,7 +4913,7 @@ function reportExportFilterText(filters = {}) {
     filters.kelompokKasId ? 'Kelompok kas: Terpilih' : '',
     filters.accountId ? 'Rekening: Terpilih' : '',
     filters.kodeToko ? `Cabang: ${filters.kodeToko}` : '',
-    filters.sourceType ? `Sumber: ${filters.sourceType === 'SYNC' ? 'NAGAGOLD' : readable(filters.sourceType)}` : '',
+    filters.sourceType ? `Sumber: ${{ SYNC: 'Semua sumber', SYNC_NAGAGOLD: 'NAGAGOLD', SYNC_OPTIK: 'OPTIK' }[filters.sourceType] || readable(filters.sourceType)}` : '',
     filters.groupBy ? `Kelompokkan: ${groupLabels[filters.groupBy] || filters.groupBy}` : '',
     viewLabel ? `Tampilan: ${viewLabel}` : '',
     filters.search ? `Pencarian: ${filters.search}` : '',

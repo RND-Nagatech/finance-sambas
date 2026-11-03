@@ -1027,6 +1027,43 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
   .table-search { width:100%; }
 }
 
+/* Jenis bisnis selalu berada pada baris filter yang sama dan memiliki ruang
+   sendiri agar tidak menempel atau menabrak heading/tabel. */
+.date-range-filter-with-business {
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  align-items:end;
+}
+.date-range-filter-with-business .filter-field,
+.business-filter-bar .filter-field { min-width:0; }
+.date-range-filter-with-business .filter-field select {
+  width:100%;
+  min-height:42px;
+  box-sizing:border-box;
+  padding:0 30px 0 12px;
+  border:1px solid #dbe2e7;
+  border-radius:4px;
+  outline:0;
+  color:#4e5c68;
+  background:#fff;
+  font:inherit;
+  font-size:11px;
+}
+.business-filter-bar {
+  display:flex;
+  align-items:flex-end;
+  gap:14px;
+  padding:18px 20px;
+  border-bottom:1px solid #dbe2e7;
+  background:linear-gradient(180deg,#fff 0%,#fbfcfd 100%);
+}
+.business-filter-bar .filter-field { width:min(100%,240px); flex:0 1 240px; }
+.business-filter-bar .filter-field select { width:100%; min-height:42px; box-sizing:border-box; }
+@media (max-width:760px) {
+  .date-range-filter-with-business { grid-template-columns:1fr; }
+  .business-filter-bar { padding:15px; }
+  .business-filter-bar .filter-field { width:100%; flex-basis:100%; }
+}
+
 /* Identitas program tetap ringkas walaupun nama di tp_system cukup panjang. */
 .brand-block { overflow:visible; }
 .brand-block > div { flex:1 1 auto; min-width:0; overflow:visible; }
@@ -1060,11 +1097,11 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .searchable-select-trigger:disabled { cursor:not-allowed; opacity:.65; }
 .searchable-select-trigger > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .searchable-select-placeholder { color:#8b9a9e; }
-.searchable-select-menu { position:absolute; z-index:100; top:calc(100% + 5px); right:0; left:0; padding:8px; border:1px solid #cbdedb; border-radius:10px; background:#fff; box-shadow:0 12px 28px rgba(39,66,72,.18); }
+.searchable-select-menu { position:fixed; z-index:1000; max-width:calc(100vw - 24px); padding:8px; border:1px solid #cbdedb; border-radius:10px; background:#fff; box-shadow:0 12px 28px rgba(39,66,72,.18); overscroll-behavior:contain; }
 .searchable-select-search { display:flex; align-items:center; gap:7px; min-height:34px; padding:0 9px; border:1px solid #b9d9d5; border-radius:7px; color:#6f8588; background:#fbfdfd; }
 .searchable-select-search:focus-within { border-color:#087c75; box-shadow:0 0 0 2px rgba(8,124,117,.1); }
 .searchable-select-search input { width:100%; min-width:0; min-height:28px; padding:0; border:0; outline:0; color:#354a4e; background:transparent; font-size:12px; }
-.searchable-select-options { display:grid; max-height:248px; margin-top:6px; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; }
+.searchable-select-options { display:grid; max-height:var(--searchable-options-max-height, 248px); margin-top:6px; overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; scrollbar-width:thin; }
 .searchable-select-option { width:100%; min-height:34px; padding:8px 9px; border:0; border-radius:6px; color:#4e5c68; background:#fff; font-size:12px; text-align:left; }
 .searchable-select-option:hover, .searchable-select-option.selected { color:#075f5a; background:#e9f6f4; }
 .searchable-select-empty { padding:12px 9px; color:#8b9a9e; font-size:11px; }
@@ -1072,8 +1109,7 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .filter-field .searchable-select-trigger { min-height:42px; }
 .report-filter-grid .searchable-select-trigger { min-height:38px; }
 @media (max-width:760px) {
-  .searchable-select-menu { position:fixed; top:auto; right:16px; bottom:16px; left:16px; }
-  .searchable-select-options { max-height:42vh; }
+  .searchable-select-options { max-height:min(var(--searchable-options-max-height, 42vh), 42vh); }
 }
 
 /* User access management */
@@ -1196,9 +1232,9 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .donut-center strong { color:#20383d; font-size:17px; letter-spacing:-.04em; }
 .donut-center small { margin-top:4px; color:#93a3a4; font-size:9px; }
 .category-legend { display:grid; gap:11px; min-width:0; }
-.category-legend > div { display:grid; grid-template-columns:10px minmax(0,1fr) auto; align-items:center; gap:8px; color:#72878a; font-size:10px; }
+.category-legend > div:not(.empty-state) { display:grid; grid-template-columns:10px minmax(0,1fr) auto; align-items:center; gap:8px; color:#72878a; font-size:10px; }
 .category-legend strong { color:#294149; font-size:10px; font-weight:700; }
-.category-legend .empty-state { min-height:0; padding:8px 0; border:0; background:transparent; text-align:left; }
+.category-legend .empty-state { display:grid; grid-template-columns:1fr; min-height:0; width:100%; padding:18px 8px; border:0; background:transparent; place-items:center; text-align:center; }
 .category-legend .empty-state strong { display:block; margin-bottom:3px; color:#40565b; font-size:11px; }
 .category-legend .empty-state p { color:#93a3a4; font-size:9px; }
 @media (max-width:1100px) {
@@ -1813,6 +1849,24 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .form-field input, .form-field select, .form-field textarea { min-height:34px; padding:6px 10px; font-size:12px; }
 .form-field .searchable-select-search { min-height:34px; padding:0 9px; border:1px solid #b9d9d5; border-radius:7px; background:#fbfdfd; box-shadow:none; }
 .form-field .searchable-select-search input, .form-field .searchable-select-search input:focus { min-height:28px; padding:0; border:0; border-radius:0; outline:0; color:#354a4e; background:transparent; box-shadow:none; }
+
+/* Dropdown tidak memakai glow hijau. Fokus tetap terlihat lewat border netral
+   agar filter laporan dan form master tidak tampak memiliki kotak berlapis. */
+.searchable-select-trigger:hover,
+.searchable-select.is-open .searchable-select-trigger,
+.searchable-select-trigger:focus,
+.searchable-select-trigger:focus-visible { border-color:#aebfc8 !important; box-shadow:none !important; }
+.searchable-select-trigger:focus-visible { outline:2px solid #aebfc8 !important; outline-offset:2px; }
+.searchable-select-search,
+.searchable-select-search:focus-within { border-color:#cfd7de !important; box-shadow:none !important; }
+.searchable-select-search input:focus,
+.searchable-select-search input:focus-visible { outline:0 !important; box-shadow:none !important; }
+.filter-field select:focus,
+.report-filter-grid input:focus { border-color:#aebfc8 !important; box-shadow:none !important; }
+.mapping-form-panel { margin-top:24px; }
+.mapping-form-panel .mapping-form { row-gap:18px; }
+.searchable-select-menu { overflow:hidden; }
+.searchable-select-options { overscroll-behavior:contain; }
 @media (max-width:1100px) { .topbar { left:220px; } .page-content { padding-right:24px; padding-left:24px; } }
 @media (max-width:760px) {
   .sidebar { top:0; }

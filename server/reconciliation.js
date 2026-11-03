@@ -23,17 +23,42 @@ export function normalizeNagagoldValue(value) {
 }
 
 export function isCashPayment(item = {}) {
-  const paymentValues = [item.jenis, item.type_trx, item.paymentMethod, item.metodePembayaran, item.source_payment_method]
+  // Pada OPTIK, type_trx hanya berarti arah buku (D/K), bukan metode bayar.
+  // Field `jenis` tetap merupakan metode pembayaran dan sudah didekripsi
+  // sebelum mapping, sehingga nilai CASH/BANK harus tetap dipakai.
+  const paymentValues = [
+    item.jenis,
+    item.jenis_pembayaran,
+    item.jenisPembayaran,
+    item.paymentMethod,
+    item.metodePembayaran,
+    item.source_payment_method,
+  ]
     .map((value) => String(value || '').trim().toUpperCase());
-  const noRekening = normalizeNagagoldValue(item.no_rekening || item.noRekening || item.sourceNoRekening);
-  return paymentValues.includes('CASH') || paymentValues.includes('TUNAI') || !noRekening;
+  const noRekening = normalizeNagagoldValue(item.source_no_rekening || item.sourceNoRekening || item.no_rekening || item.noRekening);
+  // QRIS dan GOPAY tidak membawa nomor rekening pada sumber Optik, tetapi
+  // tetap harus diperlakukan sebagai pembayaran non-tunai. BPJS untuk sementara
+  // dibukukan ke kas tunai sesuai aturan integrasi Finance.
+  if (paymentValues.includes('QRIS') || paymentValues.includes('GOPAY')) return false;
+  return paymentValues.includes('CASH') || paymentValues.includes('TUNAI') || paymentValues.includes('BPJS') || !noRekening;
 }
 
 export function sourcePaymentMethod(item = {}) {
-  if (isCashPayment(item)) return 'CASH';
-  const value = [item.jenis, item.type_trx, item.paymentMethod, item.metodePembayaran]
+  const value = [
+    item.jenis,
+    item.jenis_pembayaran,
+    item.jenisPembayaran,
+    item.paymentMethod,
+    item.metodePembayaran,
+    item.source_payment_method,
+  ]
     .map((entry) => String(entry || '').trim().toUpperCase())
     .find(Boolean);
+  if (value === 'BPJS') return 'BPJS';
+  if (value === 'QRIS') return 'QRIS';
+  if (value === 'GOPAY') return 'GOPAY';
+  if (isCashPayment(item)) return 'CASH';
+  if (value === 'TUNAI') return 'CASH';
   return value || 'BANK';
 }
 

@@ -19,6 +19,22 @@ test('CASH tidak membutuhkan nomor rekening bank', () => {
   assert.equal(isCashPayment({ jenis: 'TRANSFER', no_rekening: '123', kode_bank: 'BCA' }), false);
 });
 
+test('OPTIK memakai jenis sebagai metode pembayaran, bukan type_trx D/K', () => {
+  assert.equal(sourcePaymentMethod({ type_trx: 'D', no_rekening: '123', kode_bank: '014' }), 'BANK');
+  assert.equal(isCashPayment({ type_trx: 'K', no_rekening: '123', kode_bank: '014' }), false);
+  assert.equal(sourcePaymentMethod({ type_trx: 'D', jenis: 'CASH', no_rekening: '123', kode_bank: '014' }), 'CASH');
+  assert.equal(sourcePaymentMethod({ type_trx: 'K', jenis: 'BANK', no_rekening: '123', kode_bank: '014' }), 'BANK');
+});
+
+test('metode khusus Optik tidak salah dianggap CASH hanya karena nomor rekening kosong', () => {
+  assert.equal(sourcePaymentMethod({ jenis: 'BPJS', no_rekening: '' }), 'BPJS');
+  assert.equal(isCashPayment({ jenis: 'BPJS', no_rekening: '' }), true);
+  assert.equal(sourcePaymentMethod({ jenis: 'QRIS', no_rekening: '' }), 'QRIS');
+  assert.equal(isCashPayment({ jenis: 'QRIS', no_rekening: '' }), false);
+  assert.equal(sourcePaymentMethod({ jenis: 'GOPAY', no_rekening: 'false' }), 'GOPAY');
+  assert.equal(isCashPayment({ jenis: 'GOPAY', no_rekening: 'false' }), false);
+});
+
 test('nominal dan tanggal saja tidak cukup untuk pasangan otomatis', () => {
   const evidence = candidateEvidence(
     { isImported: true, arahDana: 'MASUK', amount: 10000000, transactionDate: '2026-10-28', kodeToko: 'QBS', rekeningId: 'cash-qbs' },

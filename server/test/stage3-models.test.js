@@ -13,6 +13,21 @@ test('pencatatan keuangan flat dengan satu rekening dapat divalidasi tanpa konek
   });
   await assert.doesNotReject(journal.validate());
   assert.equal(journal.debet, 100000);
+  assert.equal(journal.sumber, 'FINANCE');
+});
+
+test('jurnal keuangan menerima sumber integrasi yang eksplisit', async () => {
+  const journal = new JournalEntry({
+    no_keuangan: 'KU-20261029-0003',
+    tanggal: '2026-10-29',
+    tipe: 'PENJUALAN',
+    sumber: 'OPTIK',
+    rekening_id: 'ACCOUNT-OPTIK',
+    debet: 0,
+    kredit: 250000,
+  });
+  await assert.doesNotReject(journal.validate());
+  assert.equal(journal.sumber, 'OPTIK');
 });
 
 test('pencatatan keuangan tanpa rekening atau nominal ditolak sebelum disimpan', async () => {

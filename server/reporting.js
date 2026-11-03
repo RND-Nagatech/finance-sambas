@@ -34,19 +34,23 @@ function booleanFilter(value, fallback = false) {
 
 export function normalizeReportFilters(input = {}) {
   const today = localDate();
+  const selectedBranch = String(input.kodeToko || input.kode_toko || '').trim().toUpperCase();
+  const branchParts = selectedBranch.split('::');
+  const branchBusiness = branchParts.length === 2 ? branchParts[0] : '';
+  const branchCode = branchParts.length === 2 ? branchParts[1] : selectedBranch;
   const filters = {
     dateFrom: cleanDate(input.dateFrom || input.tanggalDari, firstOfMonth()),
     dateTo: cleanDate(input.dateTo || input.tanggalSampai, today),
     postingDateFrom: cleanDate(input.postingDateFrom, ''),
     postingDateTo: cleanDate(input.postingDateTo, ''),
-    kodeToko: String(input.kodeToko || input.kode_toko || '').trim().toUpperCase(),
+    kodeToko: branchCode,
     sourceType: String(input.sourceType || input.source_type || '').trim().toUpperCase(),
     jenisTransaksi: String(input.jenisTransaksi || input.jenis_transaksi || '').trim().toUpperCase(),
     bentukTransaksi: String(input.bentukTransaksi || input.bentuk_transaksi || '').trim().toUpperCase(),
     bentukSaldo: String(input.bentukSaldo || input.bentuk_saldo || input.jenisPenyimpanan || input.jenis_penyimpanan || '').trim().toUpperCase(),
     search: String(input.search || '').trim(),
     accountId: String(input.accountId || input.rekeningId || input.rekening_id || '').trim(),
-    unit: String(input.unit || input.unitBisnis || input.jenisBisnis || input.jenis_bisnis || '').trim().toUpperCase(),
+    unit: String(input.unit || input.unitBisnis || input.jenisBisnis || input.jenis_bisnis || branchBusiness).trim().toUpperCase(),
     kelompokKasId: String(input.kelompokKasId || input.kelompok_kas_id || input.cashGroupId || '').trim(),
     includeSubgroups: booleanFilter(input.includeSubgroups ?? input.sertakanSubkelompok, false),
     includeEmptyAccounts: booleanFilter(input.includeEmptyAccounts ?? input.tampilkanRekeningTanpaTransaksi, false),
@@ -85,7 +89,7 @@ function dateQuery(field, from, to) {
 
 export function transactionMongoQuery(filters, { nagagoldOnly = false, mutationOnly = false } = {}) {
   const query = { ...dateQuery('transactionDate', filters.dateFrom, filters.dateTo) };
-  if (nagagoldOnly) { query.isImported = true; query.$or = [{ jenis_bisnis: 'NAGAGOLD' }, { sourceSystem: 'nagagold' }]; }
+  if (nagagoldOnly) { query.sumber = { $in: ['NAGAGOLD', 'OPTIK'] }; }
   if (filters.kodeToko) query.kodeToko = filters.kodeToko;
   if (filters.sourceType) query.source_type = filters.sourceType === 'SYNC' ? { $in: SYNC_SOURCE_TYPES } : filters.sourceType;
   if (filters.jenisTransaksi) query.jenisTransaksi = filters.jenisTransaksi;
@@ -446,7 +450,7 @@ export async function reportDashboard(input = {}) {
     transactionCount({ ...transactionMongoQuery(filters), isImported: true, classification_status: { $in: ['REVIEW_REQUIRED', 'BLOCKED'] }, status: { $nin: ['TERCATAT', 'TERHUBUNG', 'GAGAL'] } }, { nagagoldOnly: true }),
     transactionCount({ ...transactionMongoQuery(filters), isImported: true, mappingStatus: { $in: ['PERLU_PEMETAAN', 'PEMETAAN_AMBIGU', 'GAGAL_MAPPING'] } }, { nagagoldOnly: true }),
     transactionCount({ ...transactionMongoQuery(filters), reconciliation_status: 'CONFLICT' }),
-    SyncState.find({ sourceSystem: 'nagagold', ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }).sort({ lastSuccessAt: -1 }).limit(20).lean(),
+    SyncState.find({ sourceSystem: { $in: ['nagagold', 'optik'] }, ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }).sort({ lastSuccessAt: -1 }).limit(20).lean(),
   ]);
   const accounts = balances.rows;
   const selectedAccountIds = new Set(accounts.map((row) => String(row.rekeningId || '')));
@@ -538,7 +542,11 @@ export async function reportReconciliation(input = {}) {
   return { filters, total: rows.length, summary, rows: rows.map((row) => ({ id: String(row._id), transactionNumber: row.transactionNumber, kodeToko: row.kodeToko, sourceNoReff: row.sourceNoReff || '', amount: Number(row.amount || 0), sourceInvoiceNumbers: row.sourceInvoiceNumbers || [], mappingStatus: row.mappingStatus || '', mappingReason: row.mappingReason || '', reconciliationStatus: displayReconciliationStatus(row), matchedTransactionId: row.matched_transaction_id || '', classificationStatus: row.classification_status || '', classificationReason: row.classification_reason || '', journalStatus: row.journal_status || '' })) };
 }
 
-export async function reportIntegrated(input = {}) { return reportTransactions({ ...input, sourceType: 'SYNC' }, { nagagoldOnly: true }); }
+export async function reportIntegrated(input = {}) {
+  const requestedSource = String(input.sourceType || input.source_type || '').trim().toUpperCase();
+  const sourceType = ['SYNC_NAGAGOLD', 'SYNC_OPTIK'].includes(requestedSource) ? requestedSource : 'SYNC';
+  return reportTransactions({ ...input, sourceType }, { nagagoldOnly: true });
+}
 
 export function sourceMovement(transaction) {
   const snapshotIn = Number(transaction.source_amount_in || 0);
@@ -557,6 +565,7 @@ export function reportSourceRow(transaction) {
     && !matched;
   return {
     id: String(transaction._id),
+    sumber: String(transaction.sumber || transaction.jenis_bisnis || transaction.jenisBisnis || transaction.sourceSystem || 'NAGAGOLD').trim().toUpperCase(),
     transactionNumber: transaction.transactionNumber,
     sourceTransactionId: transaction.source_transaction_id || transaction.sourceId || '',
     sourceKey: transaction.sourceKey || '',
@@ -723,6 +732,14 @@ function financialSearchText(row) {
   return [row.source, row.transactionNumber, row.journalNumber, row.accountNumber, row.accountName, row.category, row.reference, row.description, row.kodeToko, row.namaToko].filter(Boolean).join(' ').toLowerCase();
 }
 
+export function financialSource(transaction = {}) {
+  const sourceType = String(transaction.source_type || transaction.sourceType || '').trim().toUpperCase();
+  const business = String(transaction.sumber || transaction.jenis_bisnis || transaction.jenisBisnis || transaction.sourceSystem || '').trim().toUpperCase();
+  if (sourceType === 'SYNC_OPTIK' || business === 'OPTIK' || String(transaction.sourceSystem || '').trim().toLowerCase() === 'optik') return 'OPTIK';
+  if (sourceType === 'SYNC_NAGAGOLD' || business === 'NAGAGOLD' || transaction.isImported) return 'NAGAGOLD';
+  return 'FINANCE';
+}
+
 function financialRowFromEntry(journal, transaction, opening, account) {
   const accountDetails = account || {};
   const type = journalType(journal);
@@ -757,9 +774,9 @@ function financialRowFromEntry(journal, transaction, opening, account) {
     cashGroupId: accountDetails.cashGroupId || '',
     cashGroupName: accountDetails.cashGroupName || '',
     jenisKas: accountDetails.jenisKas || accountDetails.kelompok_rekening || accountDetails.jenis_akun || '-',
-    unit: accountDetails.unit || '',
-    kodeToko: transaction?.kodeToko || accountDetails.kodeToko || '',
-    namaToko: transaction?.namaTokoSnapshot || '',
+    unit: journal.jenis_bisnis || transaction?.jenisBisnis || transaction?.jenis_bisnis || accountDetails.unit || '',
+    kodeToko: journal.kode_toko || transaction?.kodeToko || accountDetails.kodeToko || '',
+    namaToko: journal.nama_toko || transaction?.namaTokoSnapshot || '',
     bankCode: accountDetails.bankCode || journal.kode_bank || '',
     reference,
     description,
@@ -773,7 +790,10 @@ function financialRowFromEntry(journal, transaction, opening, account) {
     approvedBy: journal.approved_by || '',
     createdAt: journal.dibuat_pada || journal.created_at || null,
     approvedAt: journal.approved_at || null,
-    source: transaction?.isImported ? 'NAGAGOLD' : 'FINANCE',
+    // Jurnal baru menyimpan sumber secara langsung. Fallback tetap dipakai
+    // untuk dokumen lama agar laporan tidak kehilangan klasifikasi sebelum
+    // data uji lama dibersihkan atau disinkronkan ulang.
+    source: String(journal.sumber || financialSource(transaction || {})).trim().toUpperCase(),
   };
 }
 
@@ -832,6 +852,7 @@ function sumFinancialStats(rows) {
 function financialDetailMatches(row, filters) {
   if (filters.sourceType === 'FINANCE' && row.source !== 'FINANCE') return false;
   if (filters.sourceType === 'NAGAGOLD' && row.source !== 'NAGAGOLD') return false;
+  if (filters.sourceType === 'OPTIK' && row.source !== 'OPTIK') return false;
   if (filters.kategoriKeuangan && row.categoryCode !== filters.kategoriKeuangan && row.category !== filters.kategoriKeuangan) return false;
   if (filters.jenisTransaksi && row.journalType !== filters.jenisTransaksi && String(row.transactionType || '').toUpperCase() !== filters.jenisTransaksi) return false;
   if (filters.nomorKeuangan && !String(row.journalNumber).toLowerCase().includes(filters.nomorKeuangan.toLowerCase())) return false;
@@ -968,7 +989,9 @@ export async function reportFinancial(input = {}) {
   const accounts = allAccounts.filter((account) => {
     if (filters.accountId && String(account._id) !== filters.accountId) return false;
     if (filters.unit && String(account.unit || '').toUpperCase() !== filters.unit) return false;
-    if (filters.kodeToko && String(account.kode_toko || '').toUpperCase() !== filters.kodeToko) return false;
+    // Satu rekening dapat dipakai beberapa cabang. Untuk filter cabang,
+    // sumber kebenaran adalah snapshot pada tt_keuangan, bukan kode toko
+    // yang kebetulan tersimpan di master rekening.
     if (selectedGroupIds && !selectedGroupIds.has(String(account.pos_kas_id || legacyCashGroupId(account)))) return false;
     return true;
   });
@@ -997,6 +1020,9 @@ export async function reportFinancial(input = {}) {
   if (unsnapshottedAccountIds.length) journalScopes.push({ rekening_id: { $in: unsnapshottedAccountIds }, tanggal: { $lte: filters.dateTo } });
   const journalQuery = {
     ...journalStatusQuery,
+    ...(['FINANCE', 'NAGAGOLD', 'OPTIK'].includes(filters.sourceType) ? { sumber: filters.sourceType } : {}),
+    ...(filters.unit ? { jenis_bisnis: filters.unit } : {}),
+    ...(filters.kodeToko ? { kode_toko: filters.kodeToko } : {}),
     ...(journalScopes.length ? { $or: journalScopes } : { rekening_id: { $in: accountIds }, tanggal: { $lte: filters.dateTo } }),
   };
   // Saldo berjalan dan saldo awal harus dihitung dari seluruh jurnal sampai
@@ -1031,7 +1057,7 @@ export async function reportFinancial(input = {}) {
     const opening = openingMap.get(String(journal.no_keuangan || journal.no_jurnal));
     return financialRowFromEntry(journal, transaction, opening, accountDetails.get(String(journal.rekening_id)) || { name: journal.nama_rekening, accountNumber: journal.no_rekening, accountCode: journal.no_rekening, cashGroupId: '' });
   });
-  const sourceFilteredEntries = ['FINANCE', 'NAGAGOLD'].includes(filters.sourceType)
+  const sourceFilteredEntries = ['FINANCE', 'NAGAGOLD', 'OPTIK'].includes(filters.sourceType)
     ? entries.filter((row) => row.source === filters.sourceType)
     : entries;
   const accountEntries = new Map();
@@ -1068,7 +1094,10 @@ export async function reportFinancial(input = {}) {
       hasTransactions: accountHistory.length > 0,
       hasPeriodTransactions: period.length > 0,
     };
-  }).filter((row) => filters.includeEmptyAccounts || row.hasPeriodTransactions);
+  }).filter((row) => {
+    if (filters.includeEmptyAccounts && !filters.kodeToko) return true;
+    return row.hasPeriodTransactions || (Boolean(filters.kodeToko) && row.hasTransactions);
+  });
   const accountRowMap = new Map(accountRows.map((row) => [row.accountId, row]));
   const periodEntries = sourceFilteredEntries.filter((row) => row.date >= filters.dateFrom && row.date <= filters.dateTo);
   const runningByAccount = new Map(accountRows.map((row) => [row.accountId, row.saldoSebelumPeriode || 0]));
@@ -1147,6 +1176,7 @@ export function reportRowsForExport(report, payload) {
   }
   if (['nagagold-source', 'nagagold-cash', 'nagagold-accounts'].includes(report)) return (payload.rows || []).map((row) => ({
     'Tanggal Sumber': row.sourceDate,
+    Sumber: row.sumber,
     'ID Sumber': row.sourceTransactionId,
     'No Reff': row.noReff,
     Cabang: row.kodeToko,

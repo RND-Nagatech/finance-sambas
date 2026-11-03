@@ -7,9 +7,9 @@ import {
 } from '../nagagold-classifier.js';
 import { ACCOUNT_KINDS } from '../models.js';
 
-const cashAccount = { _id: 'cash-qbs', nama_rekening: 'Kas Tunai QBS', jenis_akun: ACCOUNT_KINDS.STORE_CASH, bentuk_saldo: 'KAS_TUNAI', kode_toko: 'QBS' };
-const businessCashAccount = { _id: 'cash-ng', nama_rekening: 'Kas Tunai Nagagold', jenis_akun: ACCOUNT_KINDS.CASH_ACCOUNT, bentuk_saldo: 'KAS_TUNAI', unit: 'NAGAGOLD' };
-const bankAccount = { _id: 'bank-qbs', nama_rekening: 'Rekening BCA QBS', jenis_akun: ACCOUNT_KINDS.BANK_ACCOUNT, bentuk_saldo: 'REKENING_BANK', nomor_rekening: '123', kode_toko: 'QBS' };
+const cashAccount = { _id: 'cash-qbs', nama_rekening: 'Kas Tunai QBS', jenis_akun: ACCOUNT_KINDS.STORE_CASH, kelompok_rekening: 'KAS_KECIL', bentuk_saldo: 'KAS_TUNAI', kode_toko: 'QBS' };
+const businessCashAccount = { _id: 'cash-ng', nama_rekening: 'Kas Tunai Nagagold', jenis_akun: ACCOUNT_KINDS.CASH_ACCOUNT, kelompok_rekening: 'KAS_KECIL', bentuk_saldo: 'KAS_TUNAI', unit: 'NAGAGOLD' };
+const bankAccount = { _id: 'bank-qbs', nama_rekening: 'Rekening BCA QBS', jenis_akun: ACCOUNT_KINDS.BANK_ACCOUNT, kelompok_rekening: 'KAS_KECIL', bentuk_saldo: 'REKENING_BANK', nomor_rekening: '123', kode_toko: 'QBS' };
 
 function base(overrides = {}) {
   return {
@@ -51,6 +51,16 @@ test('CASH menggunakan akun TUNAI berdasarkan unit bisnis tanpa kode toko akun',
   assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE);
 });
 
+test('transaksi sumber yang dipetakan ke Kas Besar ditahan', () => {
+  const result = classifyNagagoldTransaction(base({ jenis_bisnis: 'NAGAGOLD' }), {
+    account: { ...businessCashAccount, kelompok_rekening: 'KAS_BESAR' },
+    sourceStatusFinal: true,
+    reconciliationCandidateCount: 0,
+  });
+  assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED);
+  assert.match(result.reason, /Kas Kecil/);
+});
+
 test('CASH ambigu masuk BLOCKED dan tidak memiliki jurnal usulan', () => {
   const result = classifyNagagoldTransaction(base({ rekeningId: '' }), { account: null, sourceStatusFinal: true, reconciliationCandidateCount: 0 });
   assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED);
@@ -83,6 +93,90 @@ test('request_id yang belum memiliki realisasi tetap perlu rekonsiliasi', () => 
 test('OPEN dianggap tervalidasi kasir sesuai aturan bisnis Finance', () => {
   const result = classifyNagagoldTransaction(base({ statusSumber: 'OPEN' }), { account: cashAccount, sourceStatusFinal: true, reconciliationCandidateCount: 0 });
   assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE);
+});
+
+test('OPTIK dengan status_valid true tetap dapat diproses meskipun status sumber kosong', () => {
+  const result = classifyNagagoldTransaction(base({
+    source_type: 'SYNC_OPTIK',
+    sourceKey: 'optik:OPT:tt_cash_daily:source-optik-1',
+    source_transaction_id: 'source-optik-1',
+    jenis_bisnis: 'OPTIK',
+    jenisSumber: 'BANK',
+    source_payment_method: 'BANK',
+    kategoriSumber: 'PENJUALAN',
+    statusSumber: '',
+    sourceFinalityStatus: 'FINAL_CONFIRMED',
+    sourceNoRekening: '123',
+    sourceKodeBank: 'BCA',
+    rekeningId: 'bank-optik',
+  }), {
+    account: { ...bankAccount, _id: 'bank-optik' },
+    accountBankCode: 'BCA',
+    sourceStatusFinal: true,
+    reconciliationCandidateCount: 0,
+  });
+  assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE);
+});
+
+test('kode bank sumber yang berbeda tidak menghalangi jika nomor rekening sama', () => {
+  const result = classifyNagagoldTransaction(base({
+    source_type: 'SYNC_OPTIK',
+    sourceKey: 'optik:OPT:tt_cash_daily:source-optik-bank-code',
+    source_transaction_id: 'source-optik-bank-code',
+    jenis_bisnis: 'OPTIK',
+    jenisSumber: 'TRANSFER',
+    source_payment_method: 'TRANSFER',
+    sourceNoRekening: '123',
+    sourceKodeBank: '002',
+    rekeningId: 'bank-optik',
+  }), {
+    account: { ...bankAccount, _id: 'bank-optik', unit: 'OPTIK', nomor_rekening: '123' },
+    accountBankCode: '014',
+    sourceStatusFinal: true,
+    reconciliationCandidateCount: 0,
+  });
+  assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE);
+  assert.doesNotMatch(result.reason, /Kode bank sumber/);
+});
+
+test('BPJS Optik dianggap kas tunai walaupun tidak mempunyai nomor rekening sumber', () => {
+  const result = classifyNagagoldTransaction(base({
+    source_type: 'SYNC_OPTIK',
+    sourceKey: 'optik:OPT:tt_cash_daily:source-optik-bpjs',
+    source_transaction_id: 'source-optik-bpjs',
+    jenis_bisnis: 'OPTIK',
+    jenisSumber: 'BPJS',
+    source_payment_method: 'BPJS',
+    sourceNoRekening: '',
+    rekeningId: 'cash-optik',
+  }), {
+    account: { ...businessCashAccount, _id: 'cash-optik', unit: 'OPTIK' },
+    sourceStatusFinal: true,
+    reconciliationCandidateCount: 0,
+  });
+  assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE);
+});
+
+test('QRIS dan GOPAY Optik diarahkan ke rekening bank tanpa wajib nomor rekening sumber', () => {
+  for (const method of ['QRIS', 'GOPAY']) {
+    const result = classifyNagagoldTransaction(base({
+      source_type: 'SYNC_OPTIK',
+      sourceKey: `optik:OPT:tt_cash_daily:source-optik-${method.toLowerCase()}`,
+      source_transaction_id: `source-optik-${method.toLowerCase()}`,
+      jenis_bisnis: 'OPTIK',
+      jenisSumber: method,
+      source_payment_method: method,
+      sourceNoRekening: '',
+      sourceKodeBank: '',
+      rekeningId: 'bank-optik',
+    }), {
+      account: { ...bankAccount, _id: 'bank-optik' },
+      accountBankCode: 'BCA',
+      sourceStatusFinal: true,
+      reconciliationCandidateCount: 0,
+    });
+    assert.equal(result.status, NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE, method);
+  }
 });
 
 test('teks terenkripsi yang tidak terbaca ditahan', () => {

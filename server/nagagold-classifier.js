@@ -1,5 +1,5 @@
 import { ACCOUNT_KINDS } from './models.js';
-import { RECONCILIATION_STATUSES } from './reconciliation.js';
+import { RECONCILIATION_STATUSES, isCashPayment } from './reconciliation.js';
 
 export const NAGAGOLD_CLASSIFICATION_STATUSES = Object.freeze({
   AUTO_ELIGIBLE: 'AUTO_ELIGIBLE',
@@ -8,7 +8,7 @@ export const NAGAGOLD_CLASSIFICATION_STATUSES = Object.freeze({
   BLOCKED: 'BLOCKED',
 });
 
-export const NAGAGOLD_CLASSIFICATION_RULE_VERSION = '5.0';
+export const NAGAGOLD_CLASSIFICATION_RULE_VERSION = '5.1';
 
 const finalStatuses = new Set(['FINAL', 'SETTLED', 'COMPLETED', 'CLOSED', 'POSTED', 'PAID']);
 
@@ -74,6 +74,12 @@ export function classifyNagagoldTransaction(transaction = {}, context = {}) {
   const jenis = normalize(transaction.jenisSumber || transaction.jenis);
   const sourceStatus = normalize(transaction.statusSumber || transaction.status);
   const paymentMethod = normalize(transaction.source_payment_method || transaction.sourcePaymentMethod || (jenis === 'CASH' ? 'CASH' : 'BANK'));
+  const cashLikePayment = isCashPayment({
+    jenis,
+    source_payment_method: paymentMethod,
+    no_rekening: transaction.sourceNoRekening || transaction.source_no_rekening,
+  });
+  const digitalOptikPayment = ['QRIS', 'GOPAY'].includes(paymentMethod);
   const amount = Number(transaction.amount || 0);
   const amountIn = Number(transaction.source_amount_in || transaction.sourceAmountIn || 0);
   const amountOut = Number(transaction.source_amount_out || transaction.sourceAmountOut || 0);
@@ -162,36 +168,29 @@ export function classifyNagagoldTransaction(transaction = {}, context = {}) {
   } else {
     const accountNumber = String(account.nomor_rekening || account.accountNumber || '').trim();
     const sourceAccountNumber = String(transaction.sourceNoRekening || transaction.source_no_rekening || '').trim();
-    const bankCode = normalize(transaction.sourceKodeBank || transaction.source_kode_bank);
-    const accountBankCode = normalize(context.accountBankCode || account.kode_bank || account.bankCode);
-    if (paymentMethod === 'CASH' || jenis === 'CASH') {
+    if (cashLikePayment || paymentMethod === 'CASH' || paymentMethod === 'BPJS' || jenis === 'CASH' || jenis === 'BPJS') {
       const sourceUnit = normalize(transaction.jenis_bisnis || transaction.jenisBisnis || transaction.unit || transaction.unitType);
       const cashKindValid = [ACCOUNT_KINDS.STORE_CASH, ACCOUNT_KINDS.CASH_ACCOUNT, ACCOUNT_KINDS.OPERATING_CASH].includes(mappedAccountKind);
       const cashUnitValid = !sourceUnit || !account.unit || sourceUnit === normalize(account.unit);
-      if (!cashKindValid || account.bentuk_saldo !== 'KAS_TUNAI' || !cashUnitValid) {
+      if (!cashKindValid || account.bentuk_saldo !== 'KAS_TUNAI' || account.kelompok_rekening !== 'KAS_KECIL' || !cashUnitValid) {
         if (!hasReconciliationPriority) status = NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED;
-        reasons.push('CASH harus dipetakan ke penyimpanan TUNAI pada unit bisnis sumber yang sama.');
+        reasons.push('CASH harus dipetakan ke penyimpanan TUNAI pada Kas Kecil dan unit bisnis sumber yang sama.');
         flags.push('CASH_ACCOUNT_KIND_INVALID');
       }
     } else {
-      if (mappedAccountKind !== ACCOUNT_KINDS.BANK_ACCOUNT || account.bentuk_saldo !== 'REKENING_BANK') {
+      if (mappedAccountKind !== ACCOUNT_KINDS.BANK_ACCOUNT || account.bentuk_saldo !== 'REKENING_BANK' || account.kelompok_rekening !== 'KAS_KECIL') {
         if (!hasReconciliationPriority) status = NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED;
-        reasons.push('Transaksi non-CASH harus dipetakan ke Rekening Bank.');
+        reasons.push('Transaksi sumber harus dipetakan ke Rekening Bank pada Kas Kecil.');
         flags.push('BANK_ACCOUNT_KIND_INVALID');
       }
-      if (!sourceAccountNumber || sourceAccountNumber === '-') {
+      if ((!sourceAccountNumber || sourceAccountNumber === '-') && !digitalOptikPayment) {
         if (!hasReconciliationPriority) status = NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED;
         reasons.push('Nomor rekening sumber belum tersedia untuk transaksi non-CASH.');
         flags.push('BANK_NUMBER_MISSING');
-      } else if (accountNumber && sourceAccountNumber !== accountNumber) {
+      } else if (accountNumber && sourceAccountNumber && sourceAccountNumber !== accountNumber) {
         if (!hasReconciliationPriority) status = NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED;
         reasons.push('Nomor rekening sumber tidak sama dengan rekening hasil mapping.');
         flags.push('BANK_NUMBER_MISMATCH');
-      }
-      if (bankCode && accountBankCode && bankCode !== accountBankCode) {
-        if (!hasReconciliationPriority) status = NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED;
-        reasons.push('Kode bank sumber tidak sama dengan bank rekening hasil mapping.');
-        flags.push('BANK_CODE_MISMATCH');
       }
     }
   }
@@ -201,16 +200,18 @@ export function classifyNagagoldTransaction(transaction = {}, context = {}) {
     reasons.push('Saldo awal diproses melalui jurnal pembukaan Finance, bukan transaksi harian Nagagold.');
     flags.push('OPENING_BALANCE');
   }
-  if (status !== NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED && status !== NAGAGOLD_CLASSIFICATION_STATUSES.RECONCILIATION_REQUIRED && sourceStatus !== 'OPEN') {
+  const sourceStatusFinal = context.sourceStatusFinal === true || transaction.sourceFinalityStatus === 'FINAL_CONFIRMED';
+  const sourceStatusLooksFinal = sourceStatus === 'OPEN' || finalStatuses.has(sourceStatus) || sourceStatusFinal;
+  if (status !== NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED && status !== NAGAGOLD_CLASSIFICATION_STATUSES.RECONCILIATION_REQUIRED && !sourceStatusLooksFinal) {
     status = NAGAGOLD_CLASSIFICATION_STATUSES.REVIEW_REQUIRED;
     reasons.push(`Status sumber ${sourceStatus || 'KOSONG'} perlu dikonfirmasi sebagai status final.`);
     flags.push('SOURCE_STATUS_REVIEW');
-  } else if (status !== NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED && status !== NAGAGOLD_CLASSIFICATION_STATUSES.RECONCILIATION_REQUIRED && !context.sourceStatusFinal) {
+  } else if (status !== NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED && status !== NAGAGOLD_CLASSIFICATION_STATUSES.RECONCILIATION_REQUIRED && !sourceStatusFinal) {
     status = NAGAGOLD_CLASSIFICATION_STATUSES.REVIEW_REQUIRED;
-    reasons.push('Status OPEN belum terbukti sebagai status final untuk posting.');
+    reasons.push('Status sumber belum terbukti sebagai status final untuk posting.');
     flags.push('SOURCE_FINALITY_UNPROVEN');
   }
-  const sourceStatusKnownFinal = (finalStatuses.has(sourceStatus) || sourceStatus === 'OPEN') && context.sourceStatusFinal === true;
+  const sourceStatusKnownFinal = sourceStatusLooksFinal && sourceStatusFinal;
   const safeForFutureAutoPost = sourceStatusKnownFinal && Boolean(category) && !hasMatchedPair && !hasReconciliationCandidate && !hasExistingJournal && !hasLinkedRequest && !hasUnreadableText(category) && !hasUnreadableText(jenis) && status !== NAGAGOLD_CLASSIFICATION_STATUSES.BLOCKED && status !== NAGAGOLD_CLASSIFICATION_STATUSES.RECONCILIATION_REQUIRED;
   if (safeForFutureAutoPost) {
     status = NAGAGOLD_CLASSIFICATION_STATUSES.AUTO_ELIGIBLE;

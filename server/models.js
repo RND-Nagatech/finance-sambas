@@ -132,7 +132,10 @@ transactionTypeSchema.set('collection', collectionName('tm_jenis_transaksi'));
 transactionTypeSchema.index({ aktif: 1, urutan: 1 });
 
 const branchSchema = new Schema({
-  kode_toko: { type: String, required: true, unique: true, trim: true, uppercase: true },
+  // Kode toko hanya unik di dalam satu sumber bisnis. Nagagold dan Optik
+  // dapat memakai kode yang sama, sehingga identitas cabang harus dibaca
+  // bersama jenis bisnisnya.
+  kode_toko: { type: String, required: true, trim: true, uppercase: true },
   nama_toko: { type: String, required: true, trim: true },
   jenis_bisnis: { type: String, default: 'NAGAGOLD', trim: true, uppercase: true },
   portal: { type: String, default: '', trim: true },
@@ -141,6 +144,8 @@ const branchSchema = new Schema({
   aktif: { type: Boolean, default: true },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: collectionName('tm_cabang'), versionKey: false });
 branchSchema.index({ aktif: 1, kode_toko: 1 });
+branchSchema.index({ jenis_bisnis: 1, kode_toko: 1 }, { unique: true, name: 'uniq_cabang_sumber_kode' });
+branchSchema.index({ jenis_bisnis: 1, database_name: 1 }, { unique: true, name: 'uniq_cabang_sumber_database' });
 
 const openingBalanceSchema = new Schema({
   rekening_id: { type: Schema.Types.ObjectId, required: true },
@@ -342,11 +347,23 @@ const journalSchema = new Schema({
   tanggal: { type: String, required: true },
   tipe: { type: String, enum: ['SALDO_AWAL', 'PENYESUAIAN_SALDO', 'MUTASI', 'PENJUALAN', 'PEMBELIAN', 'OPERASIONAL', 'TRANSAKSI', 'PEMBALIKAN'], required: true },
   status: { type: String, enum: ['PROVISIONAL', 'POSTED', 'REVERSED'], default: 'PROVISIONAL' },
+  // Sumber disimpan langsung di setiap baris keuangan agar laporan tidak
+  // perlu menebak asal transaksi melalui relasi ke tt_sinkronisasi.
+  sumber: { type: String, enum: ['FINANCE', 'NAGAGOLD', 'OPTIK'], default: 'FINANCE', uppercase: true, trim: true },
+  // Snapshot konteks bisnis disimpan saat jurnal dibuat. Satu rekening Finance
+  // dapat dipakai beberapa cabang, sehingga laporan tidak boleh mengambil
+  // cabang dari master rekening atau lookup berulang ke tt_sinkronisasi.
+  cabang_id: { type: Schema.Types.ObjectId, ref: 'FinanceBranch', default: null },
+  kode_toko: { type: String, default: '', uppercase: true, trim: true },
+  nama_toko: { type: String, default: '', trim: true },
+  jenis_bisnis: { type: String, default: '', uppercase: true, trim: true },
   rekening_id: { type: String, required: true },
   jenis_transaksi: { type: String, default: '', trim: true, uppercase: true },
   no_rekening: { type: String, default: '' },
   kode_bank: { type: String, default: '' },
   nama_rekening: { type: String, default: '' },
+  nama_bank: { type: String, default: '' },
+  bank_id: { type: Schema.Types.ObjectId, ref: 'FinanceBank', default: null },
   debet: { type: Number, default: 0, min: 0 },
   kredit: { type: Number, default: 0, min: 0 },
   keterangan: { type: String, default: '' },
@@ -360,6 +377,8 @@ const journalSchema = new Schema({
 journalSchema.index({ no_transaksi: 1, tipe: 1 }, { name: 'idx_tt_keuangan_transaksi_tipe' });
 journalSchema.index({ rekening_id: 1, tanggal: 1 }, { name: 'idx_tt_keuangan_rekening_tanggal' });
 journalSchema.index({ status: 1, tanggal: 1, rekening_id: 1 }, { name: 'idx_tt_keuangan_status_tanggal_rekening' });
+journalSchema.index({ sumber: 1, status: 1, tanggal: 1, rekening_id: 1 }, { name: 'idx_tt_keuangan_sumber_status_tanggal_rekening' });
+journalSchema.index({ jenis_bisnis: 1, kode_toko: 1, status: 1, tanggal: 1, rekening_id: 1 }, { name: 'idx_tt_keuangan_bisnis_cabang_status_tanggal_rekening' });
 journalSchema.index({ no_keuangan: 1 }, { unique: true, name: 'uniq_tt_keuangan_no_keuangan' });
 journalSchema.pre('validate', function validateFinanceEntry(next) {
   const debit = Number(this.debet || 0);
@@ -406,6 +425,7 @@ const notificationSchema = new Schema({
 
 const syncStateSchema = new Schema({
   sourceSystem: { type: String, required: true, lowercase: true },
+  sourceDatabase: { type: String, default: '', trim: true },
   kodeToko: { type: String, required: true, uppercase: true },
   sourceCollection: { type: String, required: true },
   cursorInputDate: { type: Date, default: null },
@@ -419,13 +439,18 @@ const syncStateSchema = new Schema({
   lastUpdatedCount: { type: Number, default: 0 },
   lastError: { type: String, default: '' },
 }, { timestamps: true, collection: collectionName('tm_sync_state'), versionKey: false });
-syncStateSchema.index({ sourceSystem: 1, kodeToko: 1, sourceCollection: 1 }, { unique: true });
+syncStateSchema.index({ sourceSystem: 1, sourceDatabase: 1, kodeToko: 1, sourceCollection: 1 }, { unique: true, name: 'uniq_sync_state_source_database' });
 
 const nagagoldMappingSchema = new Schema({
   source_system: { type: String, required: true, lowercase: true, default: 'nagagold' },
-  kode_toko: { type: String, required: true, uppercase: true, trim: true },
+  // Mapping berlaku untuk seluruh cabang dalam satu jenis bisnis. Kode toko
+  // tetap dipertahankan sebagai metadata legacy, tetapi bukan lagi bagian
+  // dari identitas mapping.
+  kode_toko: { type: String, default: '*', uppercase: true, trim: true },
   unit: { type: String, required: true, uppercase: true, default: 'NAGAGOLD' },
-  metode_pembayaran: { type: String, required: true, uppercase: true },
+  // Metode pembayaran diturunkan dari rekening sumber. Field ini hanya untuk
+  // kompatibilitas data lama dan tidak dipakai sebagai kunci mapping baru.
+  metode_pembayaran: { type: String, default: '', uppercase: true, trim: true },
   kode_bank: { type: String, default: '', uppercase: true, trim: true },
   nomor_rekening: { type: String, default: '', trim: true },
   jenis_akun: { type: String, required: true, enum: Object.values(ACCOUNT_KINDS) },
@@ -435,8 +460,8 @@ const nagagoldMappingSchema = new Schema({
   created_by: { type: String, default: '', trim: true, lowercase: true },
   updated_by: { type: String, default: '', trim: true, lowercase: true },
 }, { timestamps: { createdAt: 'dibuat_pada', updatedAt: 'diubah_pada' }, collection: collectionName('tm_pemetaan_rekening'), versionKey: false });
-nagagoldMappingSchema.index({ source_system: 1, kode_toko: 1, metode_pembayaran: 1, kode_bank: 1, nomor_rekening: 1 }, { unique: true, name: 'uniq_nagagold_mapping_context' });
-nagagoldMappingSchema.index({ source_system: 1, kode_toko: 1, aktif: 1 });
+nagagoldMappingSchema.index({ source_system: 1, unit: 1, nomor_rekening: 1 }, { unique: true, name: 'uniq_nagagold_mapping_source_account_number' });
+nagagoldMappingSchema.index({ source_system: 1, unit: 1, aktif: 1 });
 
 // Whitelist ini sengaja dipisahkan dari pemetaan rekening. Pemetaan menjawab
 // "transaksi masuk ke akun mana", sedangkan whitelist menjawab "kategori mana
@@ -615,6 +640,8 @@ mutationSchema.index({ matched_transaction_id: 1 });
 // tetap lengkap agar faktur dapat ditelusuri tanpa menyalinnya ke jurnal.
 const syncSchema = new Schema({
   sumber: { type: String, default: 'NAGAGOLD', uppercase: true, trim: true },
+  cabang_id: { type: Schema.Types.ObjectId, ref: 'FinanceBranch', default: null },
+  database_name: { type: String, default: '', trim: true },
   kode_toko: { type: String, default: '', uppercase: true, trim: true },
   nama_toko: { type: String, default: '', trim: true },
   id_sumber: { type: String, required: true, trim: true },
@@ -622,16 +649,27 @@ const syncSchema = new Schema({
   tanggal: { type: String, required: true },
   kategori: { type: String, default: '', uppercase: true, trim: true },
   jenis_pembayaran: { type: String, default: '', uppercase: true, trim: true },
+  // Field rekening pada sinkronisasi adalah snapshot rekening Finance hasil
+  // mapping. Nilai asli dari database sumber disimpan pada field source_*.
   no_rekening: { type: String, default: '', trim: true },
   kode_bank: { type: String, default: '', uppercase: true, trim: true },
+  nama_bank: { type: String, default: '', trim: true },
+  nama_rekening: { type: String, default: '', trim: true },
+  bank_id: { type: Schema.Types.ObjectId, ref: 'FinanceBank', default: null },
+  source_no_rekening: { type: String, default: '', trim: true },
+  source_kode_bank: { type: String, default: '', uppercase: true, trim: true },
+  source_nama_bank: { type: String, default: '', trim: true },
   jumlah_in: { type: Number, default: 0, min: 0 },
   jumlah_out: { type: Number, default: 0, min: 0 },
   // Snapshot detail sumber disimpan utuh agar faktur dan rincian Nagagold
   // tetap dapat ditelusuri tanpa menyalinnya ke tt_keuangan.
   detail_transaction: { type: [Schema.Types.Mixed], default: [] },
+  detail_faktur: { type: [String], default: [] },
+  deskripsi_sumber: { type: String, default: '', trim: true },
   request_id: { type: String, default: '', trim: true, uppercase: true },
   rekening_id: { type: Schema.Types.ObjectId, default: null },
   status_sumber: { type: String, default: '', uppercase: true, trim: true },
+  status_valid_sumber: { type: Boolean, default: null },
   status: { type: String, default: 'PERLU_DIPERIKSA', uppercase: true, trim: true },
   catatan: { type: String, default: '', trim: true },
   no_keuangan: { type: String, default: '', trim: true },
@@ -657,14 +695,14 @@ function syncInvoiceLegacy(invoice = {}) {
 
 function sourceDetailRows(document) {
   if (Array.isArray(document.detail_transaction) && document.detail_transaction.length) return document.detail_transaction;
-  return [];
+  return (Array.isArray(document.detail_faktur) ? document.detail_faktur : []).map((nomorFaktur) => ({ no_faktur: nomorFaktur }));
 }
 
 const syncVirtuals = {
   isImported: { get: () => true, set: () => {} },
   sourceSystem: { get: function get() { return String(this.sumber || '').toLowerCase(); }, set: () => {} },
-  sourceDatabase: { get: () => '', set: () => {} },
-  sourceDatabaseName: { get: () => '', set: () => {} },
+  sourceDatabase: { get: function get() { return this.database_name || ''; }, set: function set(value) { this.database_name = String(value || ''); } },
+  sourceDatabaseName: { get: function get() { return this.database_name || ''; }, set: function set(value) { this.database_name = String(value || ''); } },
   sourceCollection: { get: () => 'tt_cash_daily', set: () => {} },
   sourceId: { get: function get() { return this.id_sumber || ''; }, set: function set(value) { this.id_sumber = String(value || ''); } },
   sourceKey: { get: function get() { return `${String(this.sumber || 'NAGAGOLD').toLowerCase()}:${this.kode_toko || ''}:tt_cash_daily:${this.id_sumber || ''}`; }, set: () => {} },
@@ -678,18 +716,19 @@ const syncVirtuals = {
   source_payment_method: { get: function get() { return this.jenis_pembayaran || ''; }, set: function set(value) { this.jenis_pembayaran = String(value || ''); } },
   sourceNoReff: { get: function get() { return this.referensi_sumber || ''; }, set: function set(value) { this.referensi_sumber = String(value || ''); } },
   sourceTanggal: { get: function get() { return this.tanggal || ''; }, set: function set(value) { this.tanggal = String(value || '').slice(0, 10); } },
-  sourceNoRekening: { get: function get() { return this.no_rekening || ''; }, set: function set(value) { this.no_rekening = String(value || ''); } },
-  sourceKodeBank: { get: function get() { return this.kode_bank || ''; }, set: function set(value) { this.kode_bank = String(value || ''); } },
-  sourceNamaBank: { get: () => '', set: () => {} },
+  sourceNoRekening: { get: function get() { return this.source_no_rekening || this.no_rekening || ''; }, set: function set(value) { this.source_no_rekening = String(value || ''); } },
+  sourceKodeBank: { get: function get() { return this.source_kode_bank || ''; }, set: function set(value) { this.source_kode_bank = String(value || ''); } },
+  sourceNamaBank: { get: function get() { return this.source_nama_bank || ''; }, set: function set(value) { this.source_nama_bank = String(value || ''); } },
   sourceAmountIn: { get: function get() { return Number(this.jumlah_in || 0); }, set: function set(value) { this.jumlah_in = Number(value || 0); } },
   sourceAmountOut: { get: function get() { return Number(this.jumlah_out || 0); }, set: function set(value) { this.jumlah_out = Number(value || 0); } },
   source_amount_in: { get: function get() { return Number(this.jumlah_in || 0); }, set: function set(value) { this.jumlah_in = Number(value || 0); } },
   source_amount_out: { get: function get() { return Number(this.jumlah_out || 0); }, set: function set(value) { this.jumlah_out = Number(value || 0); } },
   sourceInvoiceDetails: { get: function get() { return sourceDetailRows(this).map(syncInvoiceLegacy).filter((invoice) => invoice.nomorFaktur); }, set: function set(value) { this.detail_transaction = Array.isArray(value) ? value : []; } },
-  sourceInvoiceNumbers: { get: function get() { return sourceDetailRows(this).map((invoice) => syncInvoiceLegacy(invoice).nomorFaktur).filter(Boolean); }, set: () => {} },
+  detailFaktur: { get: function get() { return Array.isArray(this.detail_faktur) ? this.detail_faktur : []; }, set: function set(value) { this.detail_faktur = Array.isArray(value) ? value.map((item) => String(item || '').trim()).filter(Boolean) : []; } },
+  sourceInvoiceNumbers: { get: function get() { return sourceDetailRows(this).map((invoice) => syncInvoiceLegacy(invoice).nomorFaktur).filter(Boolean); }, set: function set(value) { this.detail_faktur = Array.isArray(value) ? value : []; } },
   sourceDetailTransaction: { get: function get() { return sourceDetailRows(this); }, set: function set(value) { this.detail_transaction = Array.isArray(value) ? value : []; } },
   sourceKeterangan: { get: function get() { return this.keterangan || ''; }, set: function set(value) { this.keterangan = String(value || ''); } },
-  sourceDeskripsi: { get: function get() { return this.keterangan || ''; }, set: function set(value) { this.keterangan = String(value || ''); } },
+  sourceDeskripsi: { get: function get() { return this.deskripsi_sumber || ''; }, set: function set(value) { this.deskripsi_sumber = String(value || ''); } },
   note: { get: function get() { return this.keterangan || ''; }, set: function set(value) { this.keterangan = String(value || ''); } },
   statusSumber: { get: function get() { return this.status_sumber || ''; }, set: function set(value) { this.status_sumber = String(value || ''); } },
   kodeToko: { get: function get() { return this.kode_toko || ''; }, set: function set(value) { this.kode_toko = String(value || ''); } },
@@ -702,7 +741,7 @@ const syncVirtuals = {
   sync_status: { get: function get() { return this.status === 'TERHUBUNG' ? SYNC_STATUSES.RECONCILED : this.status === 'TERCATAT' ? SYNC_STATUSES.RECORDED : this.status === 'GAGAL' ? SYNC_STATUSES.FAILED : SYNC_STATUSES.NEEDS_REVIEW; }, set: function set(value) { this.status = value === SYNC_STATUSES.RECORDED ? 'TERCATAT' : value === SYNC_STATUSES.RECONCILED ? 'TERHUBUNG' : value === SYNC_STATUSES.FAILED ? 'GAGAL' : 'PERLU_DIPERIKSA'; } },
   sync_message: { get: function get() { return this.catatan || ''; }, set: function set(value) { this.catatan = String(value || ''); } },
   source_type: { get: () => SOURCE_TYPES.SYNC, set: () => {} },
-  jenis_bisnis: { get: () => 'NAGAGOLD', set: () => {} },
+  jenis_bisnis: { get: function get() { return String(this.sumber || 'NAGAGOLD').toUpperCase(); }, set: function set(value) { this.sumber = String(value || 'NAGAGOLD').toUpperCase(); } },
   statusValid: { get: function get() { return ['TERCATAT', 'TERHUBUNG'].includes(this.status); }, set: () => {} },
   approval_status: { get: () => APPROVAL_STATUSES.NOT_REQUIRED, set: () => {} },
   payment_status: { get: () => PAYMENT_STATUSES.NOT_APPLICABLE, set: () => {} },
@@ -717,8 +756,9 @@ const syncVirtuals = {
   classification_reason: { get: function get() { return this.catatan || ''; }, set: function set(value) { this.catatan = String(value || ''); } },
   classificationStatus: { get: function get() { return this.rekening_id ? 'AUTO_ELIGIBLE' : 'BLOCKED'; }, set: () => {} },
   classificationReason: { get: function get() { return this.catatan || ''; }, set: function set(value) { this.catatan = String(value || ''); } },
-  sourceFinalityStatus: { get: function get() { return this.status_sumber === 'OPEN' ? 'FINAL_CONFIRMED' : 'FINALITY_UNPROVEN'; }, set: () => {} },
+  sourceFinalityStatus: { get: function get() { return this.status_sumber === 'OPEN' || this.status_valid_sumber === true ? 'FINAL_CONFIRMED' : 'FINALITY_UNPROVEN'; }, set: () => {} },
   sourceFinalityNote: { get: () => '', set: () => {} },
+  sourceIsValidate: { get: function get() { return this.status_valid_sumber ?? null; }, set: function set(value) { this.status_valid_sumber = typeof value === 'boolean' ? value : null; } },
   sourceSnapshotAt: { get: function get() { return this.created_at || null; }, set: () => {} },
   sourceSnapshotProvenance: { get: () => null, set: () => {} },
   sourceSnapshotFingerprint: { get: () => '', set: () => {} },
@@ -746,16 +786,43 @@ function copySyncAliases(document) {
   return document;
 }
 
-function translateSyncPaths(value) {
-  if (Array.isArray(value)) return value.map(translateSyncPaths);
+function translateSyncPaths(value, { mode = 'query' } = {}) {
+  if (Array.isArray(value)) return value.map((item) => translateSyncPaths(item, { mode }));
   if (!value || typeof value !== 'object' || value instanceof Date || value instanceof mongoose.Types.ObjectId) return value;
-  const aliases = { isImported: 'sumber', kodeToko: 'kode_toko', namaTokoSnapshot: 'nama_toko', sourceId: 'id_sumber', source_transaction_id: 'id_sumber', sourceNoReff: 'referensi_sumber', transactionNumber: 'referensi_sumber', transactionDate: 'tanggal', requestId: 'request_id', kategoriSumber: 'kategori', kategori_sumber: 'kategori', jenisSumber: 'jenis_pembayaran', source_payment_method: 'jenis_pembayaran', sourceNoRekening: 'no_rekening', sourceKodeBank: 'kode_bank', source_amount_in: 'jumlah_in', source_amount_out: 'jumlah_out', sourceDetailTransaction: 'detail_transaction', statusSumber: 'status_sumber', rekeningId: 'rekening_id', mappingReason: 'catatan', sync_message: 'catatan', note: 'keterangan', sourceKeterangan: 'keterangan', sourceDeskripsi: 'keterangan' };
+  if (Object.prototype.hasOwnProperty.call(value, 'sourceDeskripsi')) {
+    const { sourceDeskripsi, ...rest } = value;
+    return { deskripsi_sumber: translateSyncPaths(sourceDeskripsi, { mode }), ...translateSyncPaths(rest, { mode }) };
+  }
+  const aliases = { isImported: 'sumber', kodeToko: 'kode_toko', namaTokoSnapshot: 'nama_toko', sourceId: 'id_sumber', source_transaction_id: 'id_sumber', sourceNoReff: 'referensi_sumber', transactionNumber: 'referensi_sumber', transactionDate: 'tanggal', requestId: 'request_id', kategoriSumber: 'kategori', kategori_sumber: 'kategori', jenisSumber: 'jenis_pembayaran', source_payment_method: 'jenis_pembayaran', sourceNoRekening: 'source_no_rekening', sourceKodeBank: 'source_kode_bank', sourceNamaBank: 'source_nama_bank', source_amount_in: 'jumlah_in', source_amount_out: 'jumlah_out', sourceDetailTransaction: 'detail_transaction', detailFaktur: 'detail_faktur', sourceInvoiceNumbers: 'detail_faktur', statusSumber: 'status_sumber', sourceIsValidate: 'status_valid_sumber', rekeningId: 'rekening_id', mappingReason: 'catatan', sync_message: 'catatan', note: 'keterangan', sourceKeterangan: 'keterangan', sourceDeskripsi: 'keterangan' };
   return Object.fromEntries(Object.entries(value).map(([key, nested]) => {
-    if (key === 'isImported') return ['sumber', 'NAGAGOLD'];
-    if (key === 'source_type' || key === 'sourceSystem' || key === 'jenis_bisnis' || key === 'jenisBisnis') return ['sumber', 'NAGAGOLD'];
+    const updateOperator = ['$set', '$setOnInsert', '$unset', '$inc', '$min', '$max', '$addToSet', '$push', '$pull', '$pullAll'].includes(key);
+    if (updateOperator) return [key, translateSyncPaths(nested, { mode: 'update' })];
+    if (key === 'isImported') return ['sumber', nested === true ? { $in: ['NAGAGOLD', 'OPTIK'] } : { $nin: ['NAGAGOLD', 'OPTIK'] }];
+    if (key === 'source_type' || key === 'sourceSystem' || key === 'jenis_bisnis' || key === 'jenisBisnis') {
+      // `source_type` dan `sourceSystem` adalah metadata virtual untuk
+      // pencarian/serialisasi. Nilai `SYNC` dapat diterjemahkan menjadi
+      // beberapa sumber saat query, tetapi tidak boleh ditulis sebagai
+      // `{ $in: [...] }` ke field string `sumber` di dalam `$set`.
+      if (mode === 'update' && (key === 'source_type' || key === 'sourceSystem')) return [key, undefined];
+      const sourceValue = (value) => {
+        const normalized = String(value || '').trim().toUpperCase();
+        if (normalized === 'SYNC') return ['NAGAGOLD', 'OPTIK'];
+        if (normalized === 'SYNC_NAGAGOLD') return 'NAGAGOLD';
+        if (normalized === 'SYNC_OPTIK') return 'OPTIK';
+        return normalized;
+      };
+      if (nested?.$in) return ['sumber', { $in: [...new Set(nested.$in.flatMap((value) => { const mapped = sourceValue(value); return Array.isArray(mapped) ? mapped : [mapped]; }))] }];
+      if (nested?.$nin) return ['sumber', { $nin: [...new Set(nested.$nin.flatMap((value) => { const mapped = sourceValue(value); return Array.isArray(mapped) ? mapped : [mapped]; }))] }];
+      const mapped = sourceValue(nested);
+      return ['sumber', Array.isArray(mapped) ? { $in: mapped } : mapped];
+    }
     if (key === 'sourceKey' && typeof nested === 'string') {
+      // sourceKey adalah virtual untuk pencarian, bukan field yang disimpan.
+      // Saat masuk ke $set, jangan mengubahnya menjadi $and karena MongoDB
+      // akan menganggap operator query tersebut sebagai modifier update.
+      if (mode === 'update') return [key, undefined];
       const parts = nested.split(':');
-      return parts.length >= 4 ? ['$and', [{ sumber: 'NAGAGOLD' }, { kode_toko: parts[1] }, { id_sumber: parts.slice(3).join(':') }]] : [key, nested];
+      return parts.length >= 4 ? ['$and', [{ sumber: String(parts[0] || '').toUpperCase() }, { kode_toko: parts[1] }, { id_sumber: parts.slice(3).join(':') }]] : [key, nested];
     }
     if (key === 'status') {
       const statusMap = { APPROVED: 'TERCATAT', REJECTED: 'GAGAL', MENUNGGU_VALIDASI_ADMIN: 'PERLU_DIPERIKSA', PENDING_APPROVAL: 'PERLU_DIPERIKSA' };
@@ -783,17 +850,23 @@ function translateSyncPaths(value) {
       if (nested?.$ne === BALANCE_STATUSES.APPLIED) return ['status', { $ne: 'TERCATAT' }];
     }
     if (key === 'mappingStatus') {
+      // mappingStatus adalah virtual yang diturunkan dari rekening_id. Saat
+      // update, jangan menerjemahkan nilainya menjadi operator query di dalam
+      // $set karena itu akan membuat Mongoose mencoba meng-cast objek
+      // {$exists, $ne} sebagai ObjectId.
+      if (mode === 'update') return [key, undefined];
       if (nested === 'TERPETAKAN') return ['rekening_id', { $exists: true, $ne: null }];
       if (['PERLU_PEMETAAN', 'PEMETAAN_AMBIGU', 'GAGAL_MAPPING'].includes(nested)) return ['rekening_id', null];
       // `rekening_id` adalah ObjectId pada schema baru. String kosong tidak
       // boleh dimasukkan ke `$in` karena Mongoose akan gagal melakukan cast.
       if (nested?.$in) return ['rekening_id', { $in: [null] }];
     }
-    if (['classification_status', 'classification_reason', 'classification_rule_version', 'classification_proposal', 'classification_flags', 'classified_at', 'classified_by', 'matched_transaction_id', 'matched_at', 'matched_by', 'match_method', 'match_reference', 'reconciliation_note', 'sourceDatabase', 'source_database_name', 'sourceCollection', 'sourceNamaBank', 'sourceDecryptionStatus', 'sourceDecryptionNote', 'sourceSnapshotAt', 'sourceSnapshotProvenance', 'sourceSnapshotFingerprint', 'sourceSnapshotRecoveryStatus', 'sourceFinalityStatus', 'sourceFinalityNote', 'sourceIsValidate', 'sourceStatusReceive', 'mappingStatus', 'mappingCheckedAt', 'mappingRuleKey', 'mappingCandidateIds', 'approval_status', 'payment_status', 'finance_transaction_id'].includes(key)) return [key, undefined];
+    if (['classification_status', 'classification_reason', 'classification_rule_version', 'classification_proposal', 'classification_flags', 'classified_at', 'classified_by', 'matched_transaction_id', 'matched_at', 'matched_by', 'match_method', 'match_reference', 'reconciliation_note', 'sourceDatabase', 'source_database_name', 'sourceCollection', 'sourceDecryptionStatus', 'sourceDecryptionNote', 'sourceSnapshotAt', 'sourceSnapshotProvenance', 'sourceSnapshotFingerprint', 'sourceSnapshotRecoveryStatus', 'sourceFinalityStatus', 'sourceFinalityNote', 'sourceStatusReceive', 'mappingStatus', 'mappingCheckedAt', 'mappingRuleKey', 'mappingCandidateIds', 'approval_status', 'payment_status', 'finance_transaction_id'].includes(key)) return [key, undefined];
     const target = aliases[key] || key;
     if (target === 'detail_transaction' && Array.isArray(nested)) return [target, nested];
-    if (target === 'sumber' && key === 'isImported') return [target, 'NAGAGOLD'];
-    return [target, translateSyncPaths(nested)];
+    if (target === 'detail_faktur' && Array.isArray(nested)) return [target, nested];
+    if (target === 'sumber' && key === 'isImported') return [target, nested === true ? { $in: ['NAGAGOLD', 'OPTIK'] } : { $nin: ['NAGAGOLD', 'OPTIK'] }];
+    return [target, translateSyncPaths(nested, { mode })];
   }));
 }
 
@@ -804,9 +877,9 @@ function translateSyncSort(value) {
 }
 
 syncSchema.pre(['find', 'findOne', 'findOneAndUpdate', 'updateOne', 'updateMany', 'countDocuments', 'exists'], function translateSyncQuery(next) {
-  this._conditions = translateSyncPaths(this._conditions);
-  if (this._update) this._update = translateSyncPaths(this._update);
-  if (this._fields) this._fields = translateSyncPaths(this._fields);
+  this._conditions = translateSyncPaths(this._conditions, { mode: 'query' });
+  if (this._update) this._update = translateSyncPaths(this._update, { mode: 'update' });
+  if (this._fields) this._fields = translateSyncPaths(this._fields, { mode: 'query' });
   if (this.options?.sort) this.options.sort = translateSyncSort(this.options.sort);
   next();
 });
@@ -815,7 +888,7 @@ syncSchema.post('findOne', copySyncAliases);
 syncSchema.post('findOneAndUpdate', copySyncAliases);
 syncSchema.set('toObject', { virtuals: true });
 syncSchema.set('toJSON', { virtuals: true });
-syncSchema.index({ sumber: 1, kode_toko: 1, id_sumber: 1 }, { unique: true, name: 'uniq_tt_sinkronisasi_sumber' });
+syncSchema.index({ sumber: 1, database_name: 1, kode_toko: 1, id_sumber: 1 }, { unique: true, name: 'uniq_tt_sinkronisasi_sumber_database' });
 syncSchema.index({ tanggal: -1, kode_toko: 1 });
 syncSchema.index({ status: 1, tanggal: -1 });
 syncSchema.index({ rekening_id: 1, tanggal: -1 });
