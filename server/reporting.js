@@ -501,7 +501,6 @@ async function dashboardJournalFlow(filters, accountIds = []) {
   const match = {
     status: 'POSTED',
     tanggal: { $gte: flowFrom, $lte: flowTo },
-    tipe: { $nin: ['SALDO_AWAL', 'PENYESUAIAN_SALDO', 'MUTASI', 'PEMBALIKAN'] },
   };
   if (filters.kodeToko) match.kode_toko = filters.kodeToko;
   if (filters.unit && ['NAGAGOLD', 'OPTIK'].includes(filters.unit)) match.jenis_bisnis = filters.unit;
