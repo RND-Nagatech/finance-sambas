@@ -33,13 +33,13 @@ function booleanFilter(value, fallback = false) {
 }
 
 export function normalizeReportFilters(input = {}) {
-  const today = localDate();
+  const today = cleanDate(input.__systemDate, localDate());
   const selectedBranch = String(input.kodeToko || input.kode_toko || '').trim().toUpperCase();
   const branchParts = selectedBranch.split('::');
   const branchBusiness = branchParts.length === 2 ? branchParts[0] : '';
   const branchCode = branchParts.length === 2 ? branchParts[1] : selectedBranch;
   const filters = {
-    dateFrom: cleanDate(input.dateFrom || input.tanggalDari, firstOfMonth()),
+    dateFrom: cleanDate(input.dateFrom || input.tanggalDari, today),
     dateTo: cleanDate(input.dateTo || input.tanggalSampai, today),
     postingDateFrom: cleanDate(input.postingDateFrom, ''),
     postingDateTo: cleanDate(input.postingDateTo, ''),
@@ -402,6 +402,13 @@ function dashboardCategoryLabel(transaction) {
   return raw.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase()) || 'Lainnya';
 }
 
+function dashboardTransactionUnit(transaction) {
+  const raw = String(transaction.jenis_bisnis || transaction.jenisBisnis || transaction.sumber || transaction.sourceSystem || '').trim().toUpperCase();
+  if (raw === 'OPTIK') return 'OPTIK';
+  if (raw === 'NAGAGOLD') return 'NAGAGOLD';
+  return 'FINANCE';
+}
+
 function dashboardPeriodRows(filters, transactions) {
   const start = new Date(`${filters.dateFrom}T00:00:00Z`);
   const end = new Date(`${filters.dateTo}T00:00:00Z`);
@@ -419,6 +426,7 @@ function dashboardPeriodRows(filters, transactions) {
   }
   const grouped = new Map(labels.map((label) => [label, { date: label, masuk: 0, keluar: 0 }]));
   const categories = new Map();
+  const categoriesByUnit = new Map();
   for (const transaction of transactions) {
     const key = keyFor(transaction.transactionDate);
     if (!grouped.has(key)) continue;
@@ -430,10 +438,22 @@ function dashboardPeriodRows(filters, transactions) {
       if (transaction.arahDana === 'KELUAR') row.keluar += amount;
       const category = dashboardCategoryLabel(transaction);
       categories.set(category, (categories.get(category) || 0) + amount);
+      const unit = dashboardTransactionUnit(transaction);
+      const unitCategories = categoriesByUnit.get(unit) || new Map();
+      unitCategories.set(category, (unitCategories.get(category) || 0) + amount);
+      categoriesByUnit.set(unit, unitCategories);
     }
   }
   const colors = ['#087c75', '#d4932f', '#2f7fb8', '#8a6bbd', '#d46a5c'];
-  return { rows: [...grouped.values()], granularity: monthly ? 'BULANAN' : 'HARIAN', categories: [...categories.entries()].sort(([, left], [, right]) => right - left).map(([label, value], index) => ({ label, value, color: colors[index % colors.length] })) };
+  const formatCategories = (categoryMap) => [...categoryMap.entries()]
+    .sort(([, left], [, right]) => right - left)
+    .map(([label, value], index) => ({ label, value, color: colors[index % colors.length] }));
+  return {
+    rows: [...grouped.values()],
+    granularity: monthly ? 'BULANAN' : 'HARIAN',
+    categories: formatCategories(categories),
+    categoriesByUnit: Object.fromEntries([...categoriesByUnit.entries()].map(([unit, categoryMap]) => [unit, formatCategories(categoryMap)])),
+  };
 }
 
 export async function reportDashboard(input = {}) {
@@ -504,6 +524,7 @@ export async function reportDashboard(input = {}) {
     flow: dashboardFlow.rows,
     flowGranularity: dashboardFlow.granularity,
     categories: dashboardFlow.categories,
+    categoriesByUnit: dashboardFlow.categoriesByUnit,
     operations: { pendingRequests, approvedUnpaidRequests: approvedRequests, pendingManual, needsReview, mappingFailed, reconciliationConflicts: conflicts, sync: sync.map((item) => ({ kodeToko: item.kodeToko, lastSuccessAt: item.lastSuccessAt || null, lastError: item.lastError || '', lastFetchedCount: item.lastFetchedCount || 0 })) },
   };
 }

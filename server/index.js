@@ -101,7 +101,11 @@ app.use(express.json({ type: ['application/json', 'application/*+json', 'text/pl
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
 class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, details = {}) {
+    super(message);
+    this.status = status;
+    Object.assign(this, details);
+  }
 }
 
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -201,6 +205,70 @@ async function ensureSystemProfile() {
     { $setOnInsert: { _id: SYSTEM_PROFILE_ID, tgl_system: today(), kode_toko: 'FINANCE', nama_toko: 'Finance Sambas', no_telp: '', alamat: '' } },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
+}
+
+// Tanggal bisnis Finance berasal dari profil sistem. Tanggal server hanya
+// dipakai untuk timestamp teknis dan memvalidasi agar tanggal bisnis tidak
+// berjalan melewati hari nyata.
+async function currentBusinessDate(session = null) {
+  const query = SystemProfile.findOne({ _id: SYSTEM_PROFILE_ID });
+  if (session) query.session(session);
+  const profile = await query.lean();
+  return normalizeBusinessDate(profile?.tgl_system, today());
+}
+
+async function periodStatusPayload() {
+  const profile = await ensureSystemProfile();
+  const actualDate = today();
+  const systemDate = normalizeBusinessDate(profile.tgl_system, actualDate);
+  const lastClose = await SystemLog.findOne({ type: 'TUTUP_PERIODE' }).sort({ tanggal_sampai: -1, waktu: -1 }).lean();
+  const requiresClose = systemDate < actualDate;
+  return {
+    systemDate,
+    actualDate,
+    closeDate: systemDate,
+    nextDate: addBusinessDate(systemDate),
+    lastClosedDate: String(lastClose?.tanggal_sampai || ''),
+    requiresClose,
+    lockedViews: ['requests', 'mutations', 'manual-transactions', 'nagagold-transactions'],
+  };
+}
+
+function syncStateNeedsAttention(state = {}) {
+  const lastStartedAt = state.lastStartedAt ? new Date(state.lastStartedAt).getTime() : 0;
+  const lastSuccessAt = state.lastSuccessAt ? new Date(state.lastSuccessAt).getTime() : 0;
+  return Boolean(
+    state.lastError
+    || (lastStartedAt && (!lastSuccessAt || lastStartedAt > lastSuccessAt)),
+  );
+}
+
+async function periodIntegrationStatus() {
+  const states = await SyncState.find({
+    sourceSystem: { $in: ['nagagold', 'optik'] },
+    sourceCollection: NAGAGOLD_COLLECTION,
+  }).sort({ sourceSystem: 1, kodeToko: 1 }).lean();
+  const pendingStates = states.filter(syncStateNeedsAttention).map((state) => ({
+    sourceSystem: String(state.sourceSystem || '').toUpperCase(),
+    kodeToko: String(state.kodeToko || ''),
+    sourceDatabase: String(state.sourceDatabase || ''),
+    lastError: String(state.lastError || ''),
+    lastStartedAt: state.lastStartedAt || null,
+    lastSuccessAt: state.lastSuccessAt || null,
+  }));
+  return {
+    running: nagagoldSyncRunning,
+    hasUnfinished: nagagoldSyncRunning || pendingStates.length > 0,
+    pendingStates,
+  };
+}
+
+async function assertPeriodOpen() {
+  const status = await periodStatusPayload();
+  if (status.requiresClose) {
+    throw new HttpError(423, `Periode ${status.closeDate} belum ditutup. Tutup periode terlebih dahulu sebelum mencatat transaksi baru.`);
+  }
+  return status;
 }
 
 function normalizeBusinessDate(value, fallback = today()) {
@@ -1134,6 +1202,7 @@ async function ensureReversalJournal(transaction, originalJournal, session, crea
     return existing;
   }
   if (!originalJournal || !['PROVISIONAL', 'POSTED'].includes(originalJournal.status)) return null;
+  const reversalDate = await currentBusinessDate(session);
   const snapshot = {
     cabang_id: transaction.cabang_id || transaction.cabangId || originalJournal.cabang_id || null,
     kode_toko: transaction.kodeToko || transaction.kode_toko || originalJournal.kode_toko || '',
@@ -1152,9 +1221,9 @@ async function ensureReversalJournal(transaction, originalJournal, session, crea
   const created = [];
   for (const entry of details) {
     created.push(...await JournalEntry.create([financePayload({
-      noKeuangan: await nextFinanceNumber(today(), session),
+      noKeuangan: await nextFinanceNumber(reversalDate, session),
       noTransaksi: transactionNumber(transaction),
-      tanggal: today(),
+      tanggal: reversalDate,
       tipe: 'PEMBALIKAN',
       sumber: journalSourceForTransaction(originalJournal),
       createdBy,
@@ -1162,7 +1231,7 @@ async function ensureReversalJournal(transaction, originalJournal, session, crea
       entry,
     })], { session }));
   }
-  await markBalanceSnapshotsStale(created.map((entry) => entry.rekening_id), today(), session);
+  await markBalanceSnapshotsStale(created.map((entry) => entry.rekening_id), reversalDate, session);
   created[0]._allEntries = created;
   return created[0];
 }
@@ -1184,11 +1253,12 @@ async function ensureOpeningReversalJournal(item, openingJournal, session, creat
   const existing = item.jurnal_balik_id ? await JournalEntry.findOne({ no_keuangan: item.jurnal_balik_id }).session(session || null) : null;
   if (existing) return existing;
   if (!openingJournal) return null;
+  const reversalDate = await currentBusinessDate(session);
   const [entry] = await financeEntries([
     { rekeningId: item.rekening_id, debet: 0, kredit: item.nilai, keterangan: 'Saldo awal dibalik' },
   ], session);
   const created = await JournalEntry.create([{
-    ...financePayload({ noKeuangan: await nextFinanceNumber(today(), session), tanggal: today(), tipe: 'PEMBALIKAN', sumber: journalSourceForTransaction(openingJournal), createdBy, status: 'POSTED', entry }),
+    ...financePayload({ noKeuangan: await nextFinanceNumber(reversalDate, session), tanggal: reversalDate, tipe: 'PEMBALIKAN', sumber: journalSourceForTransaction(openingJournal), createdBy, status: 'POSTED', entry }),
   }], { session });
   return created[0];
 }
@@ -2971,6 +3041,12 @@ async function fetchNagagoldBranch(branch) {
 
 async function runNagagoldSync() {
   if (nagagoldSyncRunning) return { skipped: true, reason: 'Sinkronisasi transaksi terintegrasi masih berjalan.' };
+  // Sinkronisasi dapat dipanggil dari scheduler maupun tombol UI. Keduanya
+  // harus mengikuti aturan tutup periode agar transaksi baru tidak masuk di
+  // belakang tanggal sistem yang belum ditutup. Gunakan hasil skipped agar
+  // scheduler tidak mengisi log error setiap interval.
+  const periodStatus = await periodStatusPayload();
+  if (periodStatus.requiresClose) return { skipped: true, reason: `Periode ${periodStatus.closeDate} belum ditutup.` };
   nagagoldSyncRunning = true;
   try {
   const branches = await getNagagoldBranches();
@@ -2990,6 +3066,10 @@ app.get('/api/health', (req, res) => res.json({ ok: true, service: 'finance-samb
 app.get('/api/system', asyncRoute(async (req, res) => {
   const profile = await ensureSystemProfile();
   res.json(systemProfilePayload(profile));
+}));
+
+app.get('/api/period-status', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  res.json(await periodStatusPayload());
 }));
 
 app.patch('/api/system', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
@@ -3500,25 +3580,42 @@ app.delete('/api/accounts/:id', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asy
 }));
 
 app.get('/api/saldo-snapshot', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
-  const date = normalizeBusinessDate(req.query.tanggal || req.query.date, today());
+  const date = normalizeBusinessDate(req.query.tanggal || req.query.date, await currentBusinessDate());
   const snapshots = await BalanceSnapshot.find({ tanggal_tutup: { $lte: date } }).sort({ tanggal_tutup: -1, rekening_id: 1 }).lean();
   res.json(snapshots.map((item) => ({ ...item, id: id(item._id) })));
 }));
 
 app.post('/api/saldo-snapshot/close', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
-  const date = normalizeBusinessDate(req.body?.tanggal || req.body?.date, today());
-  if (date > today()) throw new HttpError(422, 'Periode yang ditutup tidak boleh melewati tanggal sistem.');
-  const lastClose = await SystemLog.findOne({ type: 'TUTUP_PERIODE' }).sort({ tanggal_sampai: -1, waktu: -1 }).lean();
-  const previousEnd = String(lastClose?.tanggal_sampai || '');
-  const tanggalDari = previousEnd && previousEnd < date ? addBusinessDate(previousEnd) : date;
-  const result = await recalculateBalanceSnapshots(date, [], actor(req));
-  await SystemLog.create({ type: 'TUTUP_PERIODE', user: actor(req), waktu: now(), tanggal_dari: tanggalDari, tanggal_sampai: date, keterangan: `Periode ${tanggalDari} sampai ${date} ditutup.`, hasil: result });
-  await AuditLog.create({ actor: actor(req), action: 'SALDO_PERIODE_DITUTUP', entityType: 'BALANCE_SNAPSHOT', entityId: date, after: result, correlationId: createNumber('TUTUP') });
-  res.json({ ...result, tanggalDari, tanggalSampai: date, message: `Saldo periode sampai ${date} berhasil dihitung dan disimpan sebagai snapshot.` });
+  const requestedDate = normalizeBusinessDate(req.body?.tanggal || req.body?.date, await currentBusinessDate());
+  const forceClose = req.body?.force === true;
+  const integration = await periodIntegrationStatus();
+  if (integration.hasUnfinished && !forceClose) {
+    throw new HttpError(409, 'Sinkronisasi transaksi belum selesai. Periksa proses integrasi terlebih dahulu sebelum menutup periode.', {
+      code: 'INTEGRATION_PENDING',
+      integrationStatus: integration,
+    });
+  }
+  const result = await withMongoTransaction(async (session) => {
+    const profile = await SystemProfile.findOne({ _id: SYSTEM_PROFILE_ID }).session(session);
+    const systemDate = normalizeBusinessDate(profile?.tgl_system, today());
+    const actualDate = today();
+    if (requestedDate !== systemDate) throw new HttpError(409, `Tutup periode harus dilakukan untuk tanggal sistem ${systemDate}.`);
+    if (requestedDate > actualDate) throw new HttpError(422, 'Periode yang ditutup tidak boleh melewati tanggal sistem.');
+    const lastClose = await SystemLog.findOne({ type: 'TUTUP_PERIODE' }).sort({ tanggal_sampai: -1, waktu: -1 }).session(session).lean();
+    const previousEnd = String(lastClose?.tanggal_sampai || '');
+    const tanggalDari = previousEnd && previousEnd < requestedDate ? addBusinessDate(previousEnd) : requestedDate;
+    const snapshot = await recalculateBalanceSnapshots(requestedDate, [], actor(req), session);
+    const nextSystemDate = requestedDate < actualDate ? addBusinessDate(requestedDate) : requestedDate;
+    await SystemProfile.updateOne({ _id: SYSTEM_PROFILE_ID }, { $set: { tgl_system: nextSystemDate } }, { session });
+    await SystemLog.create([{ type: 'TUTUP_PERIODE', user: actor(req), waktu: now(), tanggal_dari: tanggalDari, tanggal_sampai: requestedDate, keterangan: `Periode ${tanggalDari} sampai ${requestedDate} ditutup.`, hasil: { ...snapshot, tanggalBerikutnya: nextSystemDate, integrasi: integration, ditutupDenganPeringatan: forceClose && integration.hasUnfinished } }], { session });
+    await AuditLog.create([{ actor: actor(req), action: 'SALDO_PERIODE_DITUTUP', entityType: 'BALANCE_SNAPSHOT', entityId: requestedDate, after: { ...snapshot, tanggalBerikutnya: nextSystemDate, integrasi: integration, ditutupDenganPeringatan: forceClose && integration.hasUnfinished }, correlationId: createNumber('TUTUP') }], { session });
+    return { ...snapshot, tanggalDari, tanggalSampai: requestedDate, tanggalBerikutnya: nextSystemDate, integrasi: integration, ditutupDenganPeringatan: forceClose && integration.hasUnfinished };
+  });
+  res.json({ ...result, message: `Saldo periode sampai ${result.tanggalSampai} berhasil dihitung. Tanggal sistem berikutnya ${result.tanggalBerikutnya}.` });
 }));
 
 app.post('/api/saldo-snapshot/recalculate', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
-  const date = normalizeBusinessDate(req.body?.tanggal || req.body?.date, today());
+  const date = normalizeBusinessDate(req.body?.tanggal || req.body?.date, await currentBusinessDate());
   if (date > today()) throw new HttpError(422, 'Periode tidak boleh melewati tanggal sistem.');
   const rekeningIds = Array.isArray(req.body?.rekeningIds || req.body?.rekening_ids) ? (req.body.rekeningIds || req.body.rekening_ids) : [];
   const result = await recalculateBalanceSnapshots(date, rekeningIds, actor(req));
@@ -3532,10 +3629,12 @@ app.get('/api/saldo-awal', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/saldo-awal', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const body = req.body || {};
   const date = String(body.date || '').slice(0, 10);
+  const systemDate = await currentBusinessDate();
   if (!body.rekeningId || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number(body.amount)) throw new HttpError(422, 'Rekening, tanggal, dan nilai saldo awal wajib diisi.');
-  if (date !== today()) throw new HttpError(422, `Tanggal saldo awal harus mengikuti tanggal sistem ${today()}.`);
+  if (date !== systemDate) throw new HttpError(422, `Tanggal saldo awal harus mengikuti tanggal sistem ${systemDate}.`);
   const created = await withMongoTransaction(async (session) => {
     const account = await accountById(body.rekeningId, session);
     const duplicate = await OpeningBalance.findOne({ rekening_id: body.rekeningId, status: { $in: ['PENDING_APPROVAL', 'APPROVED'] } }).session(session);
@@ -3561,6 +3660,7 @@ app.get('/api/requests', asyncRoute(async (req, res) => {
 }));
 
 app.post('/api/requests', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const body = req.body || {};
   const requestId = body.requestId || body.request_id;
   const asalPermintaan = String(body.asalPermintaan || body.asal_permintaan || (body.kodeToko || body.kode_toko ? 'CABANG' : 'INTERNAL')).trim().toUpperCase();
@@ -3583,7 +3683,7 @@ app.post('/api/requests', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (
     noRekening = String(destinationAccount?.nomor_rekening || destinationAccount?.kode_akun || '').trim().toUpperCase();
   }
   if (!sourceSystem || !jenisTransaksi || !noRekening || !Number(nilaiRp) || !requestedAt) throw new HttpError(422, 'request_id, source_system, jenis_transaksi, no_rekening, nilai_rp, dan requested_at wajib diisi.');
-  const normalizedRequestId = String(requestId || '').trim().toUpperCase() || await nextRequestNumber(String(requestedAt).slice(0, 10));
+  const normalizedRequestId = String(requestId || '').trim().toUpperCase() || await nextRequestNumber(await currentBusinessDate());
   if (!/^RQS-\d{8}-\d{4,}$/.test(normalizedRequestId)) throw new HttpError(422, 'request_id harus menggunakan format RQS-YYYYMMDD-NOMOR_URUT, contoh RQS-20261102-0001.');
   if (asalPermintaan === 'CABANG' && !kodeToko) throw new HttpError(422, 'Kode toko wajib diisi untuk permintaan dari cabang.');
   if (asalPermintaan === 'CABANG' && !['nagagold', 'optik'].includes(sourceSystem)) throw new HttpError(422, 'source_system cabang harus nagagold atau optik.');
@@ -3685,7 +3785,7 @@ async function recordRequestPayment(requestId, body, req) {
   // Realisasi mutasi selalu memakai tanggal sistem saat dicatat. Tanggal dari
   // client tidak dipercaya agar user tidak dapat backdate atau membuat saldo
   // masuk ke periode yang belum berjalan.
-  const transferDate = today();
+  const transferDate = await currentBusinessDate();
   const transferReference = String(body.transferReference || body.transfer_reference || body.paymentReference || body.payment_reference || '').trim();
   const transferProof = String(body.transferProof || body.transfer_proof || body.paymentProof || body.payment_proof || '').trim();
   const paymentNote = String(body.paymentNote || body.payment_note || body.note || '').trim().toUpperCase();
@@ -3803,6 +3903,7 @@ app.post('/api/requests/:id/reject', requireRole('OWNER', 'SUPER_USER'), asyncRo
   res.json(serializeRequest(request));
 }));
 app.post('/api/requests/:id/payment', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const result = await recordRequestPayment(req.params.id, req.body || {}, req);
   res.status(result.idempotent ? 200 : 201).json({ request: serializeRequest(result.request), transaction: serializeTransaction(result.transaction, await resolveAccountsMap()), idempotent: result.idempotent });
 }));
@@ -4175,9 +4276,9 @@ async function processManualJournalDecision(journalId, action, reason, req, sess
   if (existingReversal) return { state: 'ignored', id: journalId };
   const [reversal] = await JournalEntry.create([{
     ...financePayload({
-      noKeuangan: await nextFinanceNumber(today(), session),
+      noKeuangan: await nextFinanceNumber(await currentBusinessDate(session), session),
       noTransaksi: journal.no_transaksi,
-      tanggal: today(),
+      tanggal: await currentBusinessDate(session),
       tipe: 'PEMBALIKAN',
       sumber: journalSourceForTransaction(journal),
       status: 'POSTED',
@@ -4195,7 +4296,7 @@ async function processManualJournalDecision(journalId, action, reason, req, sess
       },
     }),
   }], { session });
-  await markBalanceSnapshotsStale([reversal.rekening_id], today(), session);
+  await markBalanceSnapshotsStale([reversal.rekening_id], await currentBusinessDate(session), session);
   const balanceUpdate = await Account.updateOne({ _id: journal.rekening_id, aktif: true }, { $inc: { saldo_akhir: Number(journal.kredit || 0) - Number(journal.debet || 0) } }, { session });
   if (balanceUpdate.modifiedCount !== 1) throw new HttpError(409, 'Rekening transaksi manual tidak ditemukan atau tidak aktif.');
   journal.status = 'REVERSED';
@@ -4227,9 +4328,10 @@ async function approveOrRejectManualTransactions(ids, action, reason = '', req) 
 }
 
 app.post('/api/manual-transactions', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const body = req.body || {};
   const rekeningId = body.rekeningId || body.rekening_id;
-  const tanggal = today();
+  const tanggal = await currentBusinessDate();
   const arahDana = String(body.arahDana || body.arah_dana || body.direction || '').trim().toUpperCase();
   const jenisTransaksi = String(body.jenisTransaksi || body.jenis_transaksi || '').trim().toUpperCase();
   const amount = Number(body.amount ?? body.nilai ?? body.nominal);
@@ -4465,6 +4567,7 @@ app.post('/api/nagagold-transactions/classification/dry-run', requireRole('ADMIN
 }));
 
 app.post('/api/nagagold-transactions/:id/validate', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const transaction = await SyncTransaction.findOne(nagagoldTransactionQuery({ _id: req.params.id }));
   if (!transaction) throw new HttpError(404, 'Transaksi Nagagold tidak ditemukan.');
   const result = await postImportedNagagoldTransaction(transaction._id);
@@ -4476,6 +4579,7 @@ app.post('/api/nagagold-transactions/:id/validate', requireRole('ADMIN', 'OWNER'
 }));
 
 app.post('/api/nagagold-transactions/bulk-validate', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
   const processed = [];
   const ignored = [];
@@ -4490,6 +4594,7 @@ app.post('/api/nagagold-transactions/bulk-validate', requireRole('ADMIN', 'OWNER
 }));
 
 app.post('/api/transactions', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(async (req, res) => {
+  await assertPeriodOpen();
   const body = req.body || {};
   const directMutation = String(body.bentukTransaksi || body.mode || '').trim().toUpperCase() === 'MUTASI_REKENING';
   if (body.requestId) {
@@ -4499,7 +4604,7 @@ app.post('/api/transactions', requireRole('ADMIN', 'SUPER_USER'), asyncRoute(asy
     return res.status(result.idempotent ? 200 : 201).json(serializeTransaction(result.transaction, await resolveAccountsMap()));
   }
   if (!body.jenisTransaksi || (!directMutation && !body.jenisRequest) || !body.sourceAccountId || !body.destinationAccountId || !Number(body.amount)) throw new HttpError(422, 'Jenis transaksi, akun sumber, akun tujuan, dan nominal wajib diisi.');
-  const transactionDate = today();
+  const transactionDate = await currentBusinessDate();
   const normalizedJenisTransaksi = String(body.jenisTransaksi).trim().toUpperCase();
   const normalizedJenisRequest = String(body.jenisRequest || (directMutation ? 'MUTASI_REKENING' : '')).trim().toUpperCase();
   if (!await TransactionType.exists({ kode_jenis: normalizedJenisTransaksi, aktif: true })) throw new HttpError(422, 'Jenis transaksi belum terdaftar atau sudah nonaktif di Master Jenis Transaksi.');
@@ -4587,7 +4692,7 @@ async function approveOrRejectLegacy(ids, action, reason = '', req) {
           const reversalJournal = await ensureReversalJournal(transaction, initialJournal, session, actor(req));
           reversal = reversalJournal?._allEntries || (reversalJournal ? [reversalJournal] : []);
         }
-        transaction.status = 'REJECTED'; transaction.statusValid = false; transaction.approval_status = APPROVAL_STATUSES.REJECTED; transaction.journal_status = JOURNAL_STATUSES.REVERSED; transaction.rejected_at = now(); transaction.rejected_by = actor(req); transaction.rejection_reason = reason.trim(); transaction.reversal = { reversalDate: transaction.reversal?.reversalDate || today(), amount: transaction.amount, sourceAccountId: id(transaction.destinationAccountId), destinationAccountId: id(transaction.sourceAccountId), journalId: id(reversal[0]?._id || transaction.reversal?.journalId) }; await transaction.save({ session });
+        transaction.status = 'REJECTED'; transaction.statusValid = false; transaction.approval_status = APPROVAL_STATUSES.REJECTED; transaction.journal_status = JOURNAL_STATUSES.REVERSED; transaction.rejected_at = now(); transaction.rejected_by = actor(req); transaction.rejection_reason = reason.trim(); transaction.reversal = { reversalDate: transaction.reversal?.reversalDate || await currentBusinessDate(session), amount: transaction.amount, sourceAccountId: id(transaction.destinationAccountId), destinationAccountId: id(transaction.sourceAccountId), journalId: id(reversal[0]?._id || transaction.reversal?.journalId) }; await transaction.save({ session });
         if (initialJournal) { await setFinanceEntriesStatus(initialEntries, 'REVERSED', session); }
         await ApprovalAction.create([{ transactionId: id(transaction._id), action: 'REJECT', actor: actor(req), reason: reason.trim(), batchId }], { session });
         await AuditLog.create([{ actor: actor(req), action: 'TRANSACTION_REJECTED_WITH_REVERSAL', entityType: 'FINANCE_TRANSACTION', entityId: id(transaction._id), after: { status: 'REJECTED', statusValid: false, reversalJournalId: id(reversal[0]._id) }, correlationId: batchId }], { session });
@@ -4696,7 +4801,7 @@ async function processTransactionDecision(transactionId, action, reason, req, se
     await setFinanceEntriesStatus(initialEntries, 'REVERSED', session);
   }
   transaction.status = 'REJECTED'; transaction.statusValid = false; transaction.approval_status = APPROVAL_STATUSES.REJECTED; transaction.payment_status = transaction.source_type === SOURCE_TYPES.BRANCH_REQUEST ? PAYMENT_STATUSES.CANCELLED : transaction.payment_status; transaction.rejected_at = now(); transaction.rejected_by = actor(req); transaction.rejection_reason = reason; transaction.journal_status = needsBalanceReversal ? JOURNAL_STATUSES.REVERSED : (initialJournal ? JOURNAL_STATUSES.REVERSED : JOURNAL_STATUSES.NOT_CREATED);
-  if (reversal && transaction.bentukTransaksi !== 'MUTASI_REKENING') transaction.reversal = { reversalDate: today(), amount: transaction.amount, sourceAccountId: id(transaction.destinationAccountId), destinationAccountId: id(transaction.sourceAccountId), journalId: id(reversal._id) };
+  if (reversal && transaction.bentukTransaksi !== 'MUTASI_REKENING') transaction.reversal = { reversalDate: await currentBusinessDate(session), amount: transaction.amount, sourceAccountId: id(transaction.destinationAccountId), destinationAccountId: id(transaction.sourceAccountId), journalId: id(reversal._id) };
   await transaction.save({ session });
   await ApprovalAction.create([{ transactionId: id(transaction._id), action: 'REJECT', actor: actor(req), reason, batchId }], { session });
   await AuditLog.create([{ actor: actor(req), action: needsBalanceReversal ? 'TRANSACTION_REJECTED_WITH_REVERSAL' : 'TRANSACTION_REJECTED_BEFORE_POSTING', entityType: 'FINANCE_TRANSACTION', entityId: id(transaction._id), after: { status: transaction.status, statusValid: false, journal_status: transaction.journal_status, reversalJournalId: id(reversal?._id) }, correlationId: batchId }], { session });
@@ -4748,7 +4853,7 @@ app.post('/api/transactions/:id/reverse', requireRole('OWNER', 'SUPER_USER'), as
     } else {
       await Account.updateOne({ _id: transaction.sourceAccountId }, { $inc: { saldo_akhir: transaction.amount } }, { session });
       await Account.updateOne({ _id: transaction.destinationAccountId }, { $inc: { saldo_akhir: -transaction.amount } }, { session });
-      transaction.reversal = { reversalDate: today(), amount: transaction.amount, sourceAccountId: id(transaction.destinationAccountId), destinationAccountId: id(transaction.sourceAccountId), journalId: id(reversal._id) };
+      transaction.reversal = { reversalDate: await currentBusinessDate(session), amount: transaction.amount, sourceAccountId: id(transaction.destinationAccountId), destinationAccountId: id(transaction.sourceAccountId), journalId: id(reversal._id) };
     }
     transaction.journal_status = JOURNAL_STATUSES.REVERSED;
     await transaction.save({ session });
@@ -4857,7 +4962,10 @@ app.post('/api/saldo-awal/:id/approve', requireRole('OWNER', 'SUPER_USER'), asyn
 app.post('/api/saldo-awal/:id/reject', requireRole('OWNER', 'SUPER_USER'), asyncRoute(async (req, res) => res.json(await approveOrRejectOpeningBalances([req.params.id], 'REJECT', req.body?.reason || '', req))));
 
 function reportHandler(loader) {
-  return asyncRoute(async (req, res) => res.json(await loader(req.query || {})));
+  return asyncRoute(async (req, res) => {
+    const query = { ...(req.query || {}), __systemDate: await currentBusinessDate() };
+    res.json(await loader(query));
+  });
 }
 
 app.get('/api/reports/dashboard', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), reportHandler(reportDashboard));
@@ -5128,7 +5236,7 @@ app.get('/api/reports/export', requireRole('ADMIN', 'OWNER', 'SUPER_USER'), asyn
   const format = String(req.query.format || 'xlsx').toLowerCase();
   if (!['financial', 'balances', 'transactions', 'integrated', 'nagagold-source', 'nagagold-cash', 'nagagold-accounts', 'mutations', 'requests', 'journals', 'reconciliation'].includes(report)) throw new HttpError(422, 'Jenis laporan export tidak didukung.');
   if (!['xlsx', 'pdf'].includes(format)) throw new HttpError(422, 'Format export hanya xlsx atau pdf.');
-  const payload = await loadReportForExport(report, req.query);
+  const payload = await loadReportForExport(report, { ...(req.query || {}), __systemDate: await currentBusinessDate() });
   if (format === 'pdf') return sendPdfExport(report, payload, res);
   return sendExcelExport(report, payload, res);
 }));
@@ -5147,7 +5255,11 @@ app.use((error, req, res, next) => {
     if (process.env.NODE_ENV === 'production') console.error(`[${req.method} ${req.path}] ${error.message || 'Internal server error'}`);
     else console.error(error);
   }
-  return res.status(status).json({ message: error.message || 'Terjadi kesalahan pada server.' });
+  return res.status(status).json({
+    message: error.message || 'Terjadi kesalahan pada server.',
+    ...(error.code ? { code: error.code } : {}),
+    ...(error.integrationStatus ? { integrationStatus: error.integrationStatus } : {}),
+  });
 });
 
 async function start() {

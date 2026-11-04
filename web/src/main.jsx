@@ -114,6 +114,10 @@ const openingBalanceSeed = [];
 // berikutnya siap ditampilkan kembali.
 const REPORT_MENU_KEYS = Object.freeze(['reports-financial', 'reports-mutations']);
 const REPORTS_MENU_ENABLED = REPORT_MENU_KEYS.length > 0;
+// Penutupan periode hanya menahan aktivitas yang dapat menambah atau
+// mengubah saldo. Laporan, master, approval, dan halaman tutup periode tetap
+// dapat dibuka agar pengguna bisa menyelesaikan penutupan dengan jelas.
+const PERIOD_LOCKED_VIEWS = Object.freeze(['requests', 'mutations', 'manual-transactions', 'nagagold-transactions']);
 
 const navGroups = [
   {
@@ -239,10 +243,10 @@ const getInitialState = () => {
   if (!API_BASE_URL) {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY));
-      if (saved?.accounts && saved?.requests && saved?.transactions) return { ...saved, systemProfile: saved.systemProfile || { tglSystem: todayJakarta(), kodeToko: 'FINANCE', namaToko: 'Finance Sambas', noTelp: '', alamat: '' }, banks: saved.banks?.length ? saved.banks : [bankSeed[0]], businessTypes: saved.businessTypes || [], cashTypes: saved.cashTypes || [], requestTypes: saved.requestTypes || [], transactionTypes: saved.transactionTypes || [], requests: saved.requests || [], transactions: saved.transactions || [], openingBalances: saved.openingBalances || [], manualTransactions: saved.manualTransactions || [], nagagoldTransactions: saved.nagagoldTransactions || [], nagagoldAccounts: saved.nagagoldAccounts || [], nagagoldMappings: saved.nagagoldMappings || [], nagagoldMappingSummary: saved.nagagoldMappingSummary || null, nagagoldMappingExamples: saved.nagagoldMappingExamples || [], nagagoldMappingSourceAccounts: saved.nagagoldMappingSourceAccounts || [], nagagoldAutoPostingRules: saved.nagagoldAutoPostingRules || [], nagagoldAutoPostingSettings: saved.nagagoldAutoPostingSettings || null, syncStatus: saved.syncStatus || [], branches: saved.branches || [], users: saved.users || [], userAccess: saved.userAccess || null, logs: saved.logs || [] };
+      if (saved?.accounts && saved?.requests && saved?.transactions) return { ...saved, systemProfile: saved.systemProfile || { tglSystem: todayJakarta(), kodeToko: 'FINANCE', namaToko: 'Finance Sambas', noTelp: '', alamat: '' }, periodStatus: saved.periodStatus || null, banks: saved.banks?.length ? saved.banks : [bankSeed[0]], businessTypes: saved.businessTypes || [], cashTypes: saved.cashTypes || [], requestTypes: saved.requestTypes || [], transactionTypes: saved.transactionTypes || [], requests: saved.requests || [], transactions: saved.transactions || [], openingBalances: saved.openingBalances || [], manualTransactions: saved.manualTransactions || [], nagagoldTransactions: saved.nagagoldTransactions || [], nagagoldAccounts: saved.nagagoldAccounts || [], nagagoldMappings: saved.nagagoldMappings || [], nagagoldMappingSummary: saved.nagagoldMappingSummary || null, nagagoldMappingExamples: saved.nagagoldMappingExamples || [], nagagoldMappingSourceAccounts: saved.nagagoldMappingSourceAccounts || [], nagagoldAutoPostingRules: saved.nagagoldAutoPostingRules || [], nagagoldAutoPostingSettings: saved.nagagoldAutoPostingSettings || null, syncStatus: saved.syncStatus || [], branches: saved.branches || [], users: saved.users || [], userAccess: saved.userAccess || null, logs: saved.logs || [] };
     } catch { /* local storage is optional */ }
   }
-  return { systemProfile: { tglSystem: todayJakarta(), kodeToko: 'FINANCE', namaToko: 'Finance Sambas', noTelp: '', alamat: '' }, accounts: [], banks: [bankSeed[0]], businessTypes: [], cashTypes: [], requestTypes: [], transactionTypes: [], requests: [], transactions: [], openingBalances: [], manualTransactions: [], nagagoldTransactions: [], nagagoldAccounts: [], nagagoldMappings: [], nagagoldMappingSummary: null, nagagoldMappingExamples: [], nagagoldMappingSourceAccounts: [], nagagoldAutoPostingRules: [], nagagoldAutoPostingSettings: null, syncStatus: [], branches: [], users: [], userAccess: null, logs: [] };
+  return { systemProfile: { tglSystem: todayJakarta(), kodeToko: 'FINANCE', namaToko: 'Finance Sambas', noTelp: '', alamat: '' }, periodStatus: null, accounts: [], banks: [bankSeed[0]], businessTypes: [], cashTypes: [], requestTypes: [], transactionTypes: [], requests: [], transactions: [], openingBalances: [], manualTransactions: [], nagagoldTransactions: [], nagagoldAccounts: [], nagagoldMappings: [], nagagoldMappingSummary: null, nagagoldMappingExamples: [], nagagoldMappingSourceAccounts: [], nagagoldAutoPostingRules: [], nagagoldAutoPostingSettings: null, syncStatus: [], branches: [], users: [], userAccess: null, logs: [] };
 };
 
 async function apiRequest(path, options = {}) {
@@ -254,7 +258,12 @@ async function apiRequest(path, options = {}) {
     sessionStorage.removeItem(AUTH_TOKEN_KEY);
     window.dispatchEvent(new Event('finance:unauthorized'));
   }
-  if (!response.ok) throw new Error(body.message || 'Request API gagal.');
+  if (!response.ok) {
+    const error = new Error(body.message || 'Request API gagal.');
+    error.status = response.status;
+    Object.assign(error, body);
+    throw error;
+  }
   return body;
 }
 
@@ -263,6 +272,22 @@ function reportQuery(filters = {}) {
   Object.entries(filters).forEach(([key, value]) => { if (value !== undefined && value !== null && value !== '') params.set(key, value); });
   const query = params.toString();
   return query ? `?${query}` : '';
+}
+
+function syncCloseWarning(syncStatus = []) {
+  const pending = (Array.isArray(syncStatus) ? syncStatus : []).filter((item) => {
+    const startedAt = item.lastStartedAt ? new Date(item.lastStartedAt).getTime() : 0;
+    const successAt = item.lastSuccessAt ? new Date(item.lastSuccessAt).getTime() : 0;
+    return Boolean(item.lastError || (startedAt && (!successAt || startedAt > successAt)));
+  });
+  if (!pending.length) return '';
+  const details = pending.slice(0, 3).map((item) => {
+    const source = String(item.sourceSystem || '').toUpperCase() || 'SUMBER';
+    const branch = item.kodeToko ? ` ${item.kodeToko}` : '';
+    return `${source}${branch}${item.lastError ? `: ${item.lastError}` : ' masih diproses'}`;
+  }).join('\n');
+  const more = pending.length > 3 ? `\nDan ${pending.length - 3} proses lain.` : '';
+  return `Perhatian: ada integrasi transaksi yang belum selesai atau perlu diperiksa.\n${details}${more}\n\nMenutup periode sekarang tetap bisa dilakukan, tetapi data yang belum selesai belum ikut dihitung sampai integrasi selesai.`;
 }
 
 async function downloadReportFile(report, filters, format) {
@@ -480,10 +505,10 @@ function App() {
   const [hydrated, setHydrated] = useState(!API_BASE_URL);
 
   const refreshFromApi = async () => {
-    const [systemProfile, accounts, banks, businessTypes, cashTypes, requestTypes, transactionTypes, requests, transactions, openingBalances, manualTransactions, nagagoldTransactions, nagagoldAccounts, syncStatus, branches, nagagoldMapping, users, userAccess, logs] = await Promise.all([apiRequest('/system'), apiRequest('/accounts'), apiRequest('/banks'), apiRequest('/business-types'), apiRequest('/cash-types'), apiRequest('/request-types'), apiRequest('/transaction-types'), apiRequest('/requests'), apiRequest('/transactions'), apiRequest('/saldo-awal'), apiRequest('/manual-transactions'), apiRequest('/nagagold-transactions'), apiRequest('/nagagold-rekening'), apiRequest('/sinkronisasi/nagagold/status'), apiRequest('/cabang'), apiRequest('/nagagold-mapping'), apiRequest('/users'), apiRequest('/user-access'), apiRequest('/logs?type=TUTUP_PERIODE')]);
-    setState({ systemProfile, accounts, banks, businessTypes, cashTypes, requestTypes, transactionTypes, requests, transactions, openingBalances, manualTransactions, nagagoldTransactions, nagagoldAccounts, nagagoldMappings: nagagoldMapping.mappings || [], nagagoldMappingSummary: nagagoldMapping.summary || null, nagagoldMappingExamples: nagagoldMapping.failedExamples || [], nagagoldMappingSourceAccounts: nagagoldMapping.sourceAccounts || [], syncStatus, branches, users, userAccess, logs });
+    const [systemProfile, periodStatus, accounts, banks, businessTypes, cashTypes, requestTypes, transactionTypes, requests, transactions, openingBalances, manualTransactions, nagagoldTransactions, nagagoldAccounts, syncStatus, branches, nagagoldMapping, users, userAccess, logs] = await Promise.all([apiRequest('/system'), apiRequest('/period-status'), apiRequest('/accounts'), apiRequest('/banks'), apiRequest('/business-types'), apiRequest('/cash-types'), apiRequest('/request-types'), apiRequest('/transaction-types'), apiRequest('/requests'), apiRequest('/transactions'), apiRequest('/saldo-awal'), apiRequest('/manual-transactions'), apiRequest('/nagagold-transactions'), apiRequest('/nagagold-rekening'), apiRequest('/sinkronisasi/nagagold/status'), apiRequest('/cabang'), apiRequest('/nagagold-mapping'), apiRequest('/users'), apiRequest('/user-access'), apiRequest('/logs?type=TUTUP_PERIODE')]);
+    setState({ systemProfile, periodStatus, accounts, banks, businessTypes, cashTypes, requestTypes, transactionTypes, requests, transactions, openingBalances, manualTransactions, nagagoldTransactions, nagagoldAccounts, nagagoldMappings: nagagoldMapping.mappings || [], nagagoldMappingSummary: nagagoldMapping.summary || null, nagagoldMappingExamples: nagagoldMapping.failedExamples || [], nagagoldMappingSourceAccounts: nagagoldMapping.sourceAccounts || [], syncStatus, branches, users, userAccess, logs });
     setApiConnected(true);
-    return { systemProfile, accounts, banks, businessTypes, cashTypes, requestTypes, transactionTypes, requests, transactions, openingBalances, manualTransactions, nagagoldTransactions, nagagoldAccounts, nagagoldMappings: nagagoldMapping.mappings || [], nagagoldMappingSummary: nagagoldMapping.summary || null, nagagoldMappingExamples: nagagoldMapping.failedExamples || [], nagagoldMappingSourceAccounts: nagagoldMapping.sourceAccounts || [], syncStatus, branches, users, userAccess, logs };
+    return { systemProfile, periodStatus, accounts, banks, businessTypes, cashTypes, requestTypes, transactionTypes, requests, transactions, openingBalances, manualTransactions, nagagoldTransactions, nagagoldAccounts, nagagoldMappings: nagagoldMapping.mappings || [], nagagoldMappingSummary: nagagoldMapping.summary || null, nagagoldMappingExamples: nagagoldMapping.failedExamples || [], nagagoldMappingSourceAccounts: nagagoldMapping.sourceAccounts || [], syncStatus, branches, users, userAccess, logs };
   };
 
   const runNagagoldSync = async () => {
@@ -512,6 +537,20 @@ function App() {
     if (!API_BASE_URL || !session) return undefined;
     refreshFromApi().catch(() => { if (!cancelled) setApiConnected(false); }).finally(() => { if (!cancelled) setHydrated(true); });
     return () => { cancelled = true; };
+  }, [session]);
+  useEffect(() => {
+    if (!API_BASE_URL || !session) return undefined;
+    let cancelled = false;
+    const checkPeriodStatus = () => {
+      apiRequest('/period-status')
+        .then((periodStatus) => {
+          if (!cancelled) setState((current) => ({ ...current, periodStatus }));
+        })
+        .catch(() => { /* status lama tetap dipakai sampai koneksi pulih */ });
+    };
+    checkPeriodStatus();
+    const timer = window.setInterval(checkPeriodStatus, 60_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [session]);
   useEffect(() => {
     const handleUnauthorized = () => { sessionStorage.removeItem(ACTIVE_VIEW_KEY); setView('dashboard'); setSession(null); setApiConnected(false); setHydrated(false); setUserMenuOpen(false); };
@@ -599,6 +638,10 @@ function App() {
   const currentMenuAccess = Array.isArray(configuredMenuAccess)
     ? configuredMenuAccess.filter((menuId) => session?.role !== 'USER' || menuId !== 'users-manage')
     : configuredMenuAccess;
+  const periodLocked = Boolean(state.periodStatus?.requiresClose && PERIOD_LOCKED_VIEWS.includes(view));
+  useEffect(() => {
+    if (periodLocked) setModal(null);
+  }, [periodLocked]);
   useEffect(() => {
     if (!API_BASE_URL || !hydrated || !Array.isArray(currentMenuAccess)) return;
     if (view !== 'dashboard' && !currentMenuAccess.includes(view)) setView('dashboard');
@@ -702,7 +745,8 @@ function App() {
     const sourceSystem = isBranchRequest ? String(form.jenisBisnisSumber || '').trim().toLowerCase() : 'finance';
     const branch = isBranchRequest ? availableBranches.find((item) => String(item.kodeToko || item.code).toUpperCase() === String(form.kodeToko || '').toUpperCase() && String(item.jenisBisnis || item.jenis_bisnis || 'NAGAGOLD').toUpperCase() === sourceSystem.toUpperCase()) : null;
     if (!form.asalPermintaan || !form.jenisTransaksi || !form.tujuanAccountId || !form.noRekening || !Number(form.nilaiRp) || (!isBranchRequest && !form.unitPemohon) || (isBranchRequest && (!form.jenisBisnisSumber || !form.kodeToko || !branch))) { showToast(isBranchRequest ? 'Asal, jenis bisnis sumber, cabang, rekening tujuan, dan nominal wajib dipilih.' : 'Asal, jenis transaksi, rekening tujuan, nominal, dan pemohon wajib dipilih.'); return; }
-    const request = { ...form, id: `rq-${Date.now()}`, requestId: nextLocalNumber('RQS', new Date().toISOString().slice(0, 10), state.requests, (item) => item.requestId), sourceSystem, jenisBisnis: isBranchRequest ? sourceSystem.toUpperCase() : 'FINANCE', namaToko: branch?.namaToko || branch?.name || '', nilaiRp: Number(form.nilaiRp), requestedAt: new Date().toISOString(), status: 'REQUESTED' };
+    const requestDate = businessDate(state.systemProfile?.tglSystem);
+    const request = { ...form, id: `rq-${Date.now()}`, requestId: nextLocalNumber('RQS', requestDate, state.requests, (item) => item.requestId), sourceSystem, jenisBisnis: isBranchRequest ? sourceSystem.toUpperCase() : 'FINANCE', namaToko: branch?.namaToko || branch?.name || '', nilaiRp: Number(form.nilaiRp), requestedAt: new Date().toISOString(), status: 'REQUESTED' };
     if (apiConnected) {
       try { await apiRequest('/requests', { method: 'POST', body: JSON.stringify({ sourceSystem: request.sourceSystem, asalPermintaan: request.asalPermintaan, unitPemohon: request.unitPemohon, namaPemohon: request.namaPemohon, jenisTransaksi: request.jenisTransaksi, destinationAccountId: request.tujuanAccountId || '', ...(isBranchRequest ? { kodeToko: request.kodeToko, namaToko: request.namaToko } : {}), noRekening: request.noRekening, nilaiRp: request.nilaiRp, requestedAt: request.requestedAt, tujuan: request.tujuan }) }); await refreshFromApi(); setModal(null); showToast('Permintaan dana berhasil ditambahkan.'); } catch (error) { showToast(error.message); }
       return;
@@ -745,7 +789,7 @@ function App() {
     if (!form.rekeningId || !form.jenisTransaksi || !['MASUK', 'KELUAR'].includes(form.arahDana) || !Number(form.amount)) { showToast('Arah transaksi, jenis transaksi, rekening, dan nominal wajib diisi.'); return; }
     const account = state.accounts.find((item) => item.id === form.rekeningId);
     if (!account) { showToast('Rekening tidak ditemukan.'); return; }
-    const tanggal = todayJakarta();
+    const tanggal = businessDate(state.systemProfile?.tglSystem);
     const item = { ...form, tanggal, id: `manual-${Date.now()}`, transactionNumber: nextLocalNumber('TRX', tanggal, state.manualTransactions || [], (entry) => entry.transactionNumber), noKeuangan: nextLocalNumber('KU', tanggal, state.manualTransactions || [], (entry) => entry.noKeuangan), amount: Number(form.amount), status: 'PENDING_APPROVAL', approvalStatus: 'PENDING_APPROVAL', journalStatus: 'PROVISIONAL', rekeningName: account.name, sourceType: 'MANUAL_ADMIN', isManualTransaction: true, note: String(form.note || '').trim().toUpperCase() || '-' };
     if (apiConnected) {
       try { await apiRequest('/manual-transactions', { method: 'POST', body: JSON.stringify(form) }); await refreshFromApi(); setModal(null); showToast('Transaksi manual tercatat dan menunggu approval Owner.'); } catch (error) { showToast(error.message); }
@@ -810,7 +854,7 @@ function App() {
   };
 
   const submitOpeningBalance = async (form) => {
-    const systemDate = todayJakarta();
+    const systemDate = businessDate(state.systemProfile?.tglSystem);
     if (String(form.date || '') !== systemDate) { showToast(`Tanggal saldo awal harus mengikuti tanggal sistem ${systemDate}.`); return; }
     const duplicate = (state.openingBalances || []).some((item) => ['PENDING_APPROVAL', 'APPROVED'].includes(String(item.status || '').toUpperCase()) && String(item.rekeningId || item.rekening_id || '') === String(form.rekeningId || ''));
     if (duplicate) { showToast('Rekening tersebut sudah memiliki saldo awal atau saldo awalnya sedang menunggu approval.'); return; }
@@ -1239,9 +1283,19 @@ function App() {
   const closeFinancialPeriod = async (date) => {
     if (!apiConnected) { showToast('Backend laporan belum terhubung.'); return null; }
     const closingDate = date || state.systemProfile?.tglSystem || todayJakarta();
-    if (!await askDialog('confirm', `Periode sampai tanggal ${closingDate} akan ditutup. Lanjutkan? Sistem akan menyimpan snapshot saldo per rekening dan tetap menghitung ulang otomatis jika ada transaksi susulan.`)) return null;
+    const warning = syncCloseWarning(state.syncStatus);
+    const confirmation = [`Periode sampai tanggal ${closingDate} akan ditutup. Lanjutkan? Sistem akan menyimpan snapshot saldo per rekening dan tetap menghitung ulang otomatis jika ada transaksi susulan.`, warning].filter(Boolean).join('\n\n');
+    if (!await askDialog('confirm', confirmation)) return null;
     try {
-      const result = await apiRequest('/saldo-snapshot/close', { method: 'POST', body: JSON.stringify({ tanggal: closingDate }) });
+      let result;
+      try {
+        result = await apiRequest('/saldo-snapshot/close', { method: 'POST', body: JSON.stringify({ tanggal: closingDate, force: Boolean(warning) }) });
+      } catch (error) {
+        if (error.code !== 'INTEGRATION_PENDING') throw error;
+        const detail = error.message || 'Sinkronisasi transaksi belum selesai.';
+        if (!await askDialog('confirm', `${detail}\n\nTetap tutup periode sekarang? Data integrasi yang belum selesai akan diproses setelah sinkronisasi selesai.`)) return null;
+        result = await apiRequest('/saldo-snapshot/close', { method: 'POST', body: JSON.stringify({ tanggal: closingDate, force: true }) });
+      }
       await refreshFromApi();
       showToast(result.message || `Periode ${closingDate} berhasil ditutup.`);
       return result;
@@ -1296,31 +1350,33 @@ function App() {
             <div className="user-menu"><button className="user-chip user-menu-trigger" type="button" onClick={() => setUserMenuOpen((current) => !current)} aria-label="Buka menu akun" aria-expanded={userMenuOpen}><span className="user-avatar">{String(session?.name || 'F').slice(0, 1).toUpperCase()}</span><ChevronDown size={14} /></button>{userMenuOpen && <div className="user-menu-popover"><div><strong>{session?.name || 'User'}</strong><small>{session?.username || ''}</small></div><button className="logout-button" type="button" onClick={handleLogout}><LogOut size={15} />Keluar</button></div>}</div>
           </div>
         </header>
-        <main className="page-content">
-          {view === 'dashboard' && <Dashboard state={state} pendingTransactions={pendingTransactions} pendingManualTransactions={pendingManualTransactions} setView={setView} setDetail={openTransactionDetail} apiConnected={apiConnected} loadReport={loadReport} />}
-          {view === 'verification' && <Verification transactions={state.transactions} openingBalances={state.openingBalances} manualTransactions={state.manualTransactions || []} accounts={state.accounts} setDetail={openTransactionDetail} actionLoading={actionLoading} onApproveCombined={approveCombined} onRejectCombined={rejectCombined} />}
-          {view === 'requests' && <Requests requests={state.requests} openCreate={() => setModal({ type: 'request' })} openTransaction={(request) => setModal({ type: 'mutation', request })} onAcceptRequest={acceptRequest} onRejectRequest={(id) => rejectRequestWithConfirmation(id, true)} onApproveRequest={approveRequestWithConfirmation} onRejectApprovedRequest={(id) => rejectRequestWithConfirmation(id)} />}
-          {view === 'mutations' && <Mutations transactions={state.transactions} accounts={state.accounts} openCreate={() => setModal({ type: 'mutation' })} setDetail={openTransactionDetail} />}
-          {view === 'nagagold-transactions' && <NagagoldTransactionsSimple transactions={state.nagagoldTransactions || []} syncStatus={state.syncStatus || []} branches={state.branches || []} accounts={state.accounts} setDetail={openTransactionDetail} onSync={runNagagoldSync} apiConnected={apiConnected} />}
-          {view === 'nagagold-mapping' && <NagagoldMappingPage mappings={state.nagagoldMappings || []} summary={state.nagagoldMappingSummary} examples={state.nagagoldMappingExamples || []} sourceAccounts={state.nagagoldMappingSourceAccounts || []} businessTypes={state.businessTypes || []} accounts={state.accounts || []} banks={state.banks || []} onSave={saveNagagoldMapping} onTest={testNagagoldMapping} onBulkPreview={previewNagagoldMapping} onPreviewRecovery={runNagagoldSnapshotRecoveryPreview} onApplyRecovery={applyNagagoldSnapshotRecovery} onCreateAccount={createAccountForMapping} onCreateBank={createBankForMapping} canApplySnapshotRecovery={['OWNER', 'SUPER_USER'].includes(session?.role)} apiConnected={apiConnected} />}
-          {view === 'manual-transactions' && <ManualTransactions items={state.manualTransactions || []} accounts={state.accounts} openCreate={() => setModal({ type: 'manual-transaction' })} setDetail={openTransactionDetail} canCreate={['ADMIN', 'SUPER_USER'].includes(session?.role)} />}
-          {view === 'period-close' && <PeriodClosePage systemProfile={state.systemProfile} onClosePeriod={closeFinancialPeriod} apiConnected={apiConnected} />}
-          {view === 'banks' && <Banks banks={state.banks} openCreate={() => setModal({ type: 'bank' })} openEdit={(item) => setModal({ type: 'bank', item })} onDelete={deleteBank} />}
-          {view === 'business-types' && <BusinessTypes items={state.businessTypes || []} openCreate={() => setModal({ type: 'business-type' })} openEdit={(item) => setModal({ type: 'business-type', item })} onDelete={deleteBusinessType} />}
-          {view === 'branches' && <Branches branches={state.branches || []} openCreate={() => setModal({ type: 'branch' })} openEdit={(item) => setModal({ type: 'branch', item })} onDelete={deleteBranch} apiConnected={apiConnected} />}
-          {view === 'accounts' && <Accounts accounts={state.accounts} openingBalances={state.openingBalances} transactions={state.transactions} openCreate={() => setModal({ type: 'account' })} openEdit={(item) => setModal({ type: 'account', item })} onDelete={deleteAccount} />}
-          {view === 'cash-types' && <CashTypes items={state.cashTypes || cashTypeSeed} openCreate={() => setModal({ type: 'cash-type' })} openEdit={(item) => setModal({ type: 'cash-type', item })} onToggle={toggleCashType} onDelete={deleteCashType} apiConnected={apiConnected} />}
-          {view === 'transaction-types' && <MasterOptions title="Master Jenis Transaksi" eyebrow="Data Master" description="Kelola jenis kejadian keuangan yang digunakan pada transaksi Finance." items={state.transactionTypes || transactionTypeSeed} openCreate={() => setModal({ type: 'transaction-type' })} openEdit={(item) => setModal({ type: 'transaction-type', item })} onDelete={(item) => deleteMasterOption('transaction', item)} />}
-          {view === 'users-data' && <UserDataPage users={state.users || []} openCreate={() => setModal({ type: 'user' })} openEdit={(item) => setModal({ type: 'user', item })} onToggle={toggleUser} apiConnected={apiConnected} canManageUsers={canManageUsers} />}
-          {view === 'users-manage' && <UserAccessPage access={state.userAccess} onSave={runAction(saveUserAccess)} apiConnected={apiConnected} canEdit={canManageUsers} />}
-          {reportViewKeys[view] && <Reports key={view} initialReportKey={reportViewKeys[view]} transactions={visibleTransactions} state={state} apiConnected={apiConnected} loadReport={loadReport} exportReport={exportReport} setDetail={openTransactionDetail} />}
+        <main className={`page-content ${periodLocked ? 'page-content-period-locked' : ''}`}>
+          {periodLocked ? <PeriodBlockedOverlay status={state.periodStatus} onOpenClose={() => closeFinancialPeriod(state.periodStatus?.closeDate || state.systemProfile?.tglSystem || todayJakarta())} /> : <>
+            {view === 'dashboard' && <Dashboard state={state} systemDate={state.systemProfile?.tglSystem} pendingTransactions={pendingTransactions} pendingManualTransactions={pendingManualTransactions} setView={setView} setDetail={openTransactionDetail} apiConnected={apiConnected} loadReport={loadReport} />}
+            {view === 'verification' && <Verification systemDate={state.systemProfile?.tglSystem} transactions={state.transactions} openingBalances={state.openingBalances} manualTransactions={state.manualTransactions || []} accounts={state.accounts} setDetail={openTransactionDetail} actionLoading={actionLoading} onApproveCombined={approveCombined} onRejectCombined={rejectCombined} />}
+            {view === 'requests' && <Requests systemDate={state.systemProfile?.tglSystem} requests={state.requests} openCreate={() => setModal({ type: 'request' })} openTransaction={(request) => setModal({ type: 'mutation', request })} onAcceptRequest={acceptRequest} onRejectRequest={(id) => rejectRequestWithConfirmation(id, true)} onApproveRequest={approveRequestWithConfirmation} onRejectApprovedRequest={(id) => rejectRequestWithConfirmation(id)} />}
+            {view === 'mutations' && <Mutations systemDate={state.systemProfile?.tglSystem} transactions={state.transactions} accounts={state.accounts} openCreate={() => setModal({ type: 'mutation' })} setDetail={openTransactionDetail} />}
+            {view === 'nagagold-transactions' && <NagagoldTransactionsSimple systemDate={state.systemProfile?.tglSystem} transactions={state.nagagoldTransactions || []} syncStatus={state.syncStatus || []} branches={state.branches || []} accounts={state.accounts} setDetail={openTransactionDetail} onSync={runNagagoldSync} apiConnected={apiConnected} />}
+            {view === 'nagagold-mapping' && <NagagoldMappingPage mappings={state.nagagoldMappings || []} summary={state.nagagoldMappingSummary} examples={state.nagagoldMappingExamples || []} sourceAccounts={state.nagagoldMappingSourceAccounts || []} businessTypes={state.businessTypes || []} accounts={state.accounts || []} banks={state.banks || []} onSave={saveNagagoldMapping} onTest={testNagagoldMapping} onBulkPreview={previewNagagoldMapping} onPreviewRecovery={runNagagoldSnapshotRecoveryPreview} onApplyRecovery={applyNagagoldSnapshotRecovery} onCreateAccount={createAccountForMapping} onCreateBank={createBankForMapping} canApplySnapshotRecovery={['OWNER', 'SUPER_USER'].includes(session?.role)} apiConnected={apiConnected} />}
+            {view === 'manual-transactions' && <ManualTransactions systemDate={state.systemProfile?.tglSystem} items={state.manualTransactions || []} accounts={state.accounts} openCreate={() => setModal({ type: 'manual-transaction' })} setDetail={openTransactionDetail} canCreate={['ADMIN', 'SUPER_USER'].includes(session?.role)} />}
+            {view === 'period-close' && <PeriodClosePage systemProfile={state.systemProfile} onClosePeriod={closeFinancialPeriod} apiConnected={apiConnected} />}
+            {view === 'banks' && <Banks banks={state.banks} openCreate={() => setModal({ type: 'bank' })} openEdit={(item) => setModal({ type: 'bank', item })} onDelete={deleteBank} />}
+            {view === 'business-types' && <BusinessTypes items={state.businessTypes || []} openCreate={() => setModal({ type: 'business-type' })} openEdit={(item) => setModal({ type: 'business-type', item })} onDelete={deleteBusinessType} />}
+            {view === 'branches' && <Branches branches={state.branches || []} openCreate={() => setModal({ type: 'branch' })} openEdit={(item) => setModal({ type: 'branch', item })} onDelete={deleteBranch} apiConnected={apiConnected} />}
+            {view === 'accounts' && <Accounts accounts={state.accounts} openingBalances={state.openingBalances} transactions={state.transactions} openCreate={() => setModal({ type: 'account' })} openEdit={(item) => setModal({ type: 'account', item })} onDelete={deleteAccount} />}
+            {view === 'cash-types' && <CashTypes items={state.cashTypes || cashTypeSeed} openCreate={() => setModal({ type: 'cash-type' })} openEdit={(item) => setModal({ type: 'cash-type', item })} onToggle={toggleCashType} onDelete={deleteCashType} apiConnected={apiConnected} />}
+            {view === 'transaction-types' && <MasterOptions title="Master Jenis Transaksi" eyebrow="Data Master" description="Kelola jenis kejadian keuangan yang digunakan pada transaksi Finance." items={state.transactionTypes || transactionTypeSeed} openCreate={() => setModal({ type: 'transaction-type' })} openEdit={(item) => setModal({ type: 'transaction-type', item })} onDelete={(item) => deleteMasterOption('transaction', item)} />}
+            {view === 'users-data' && <UserDataPage users={state.users || []} openCreate={() => setModal({ type: 'user' })} openEdit={(item) => setModal({ type: 'user', item })} onToggle={toggleUser} apiConnected={apiConnected} canManageUsers={canManageUsers} />}
+            {view === 'users-manage' && <UserAccessPage access={state.userAccess} onSave={runAction(saveUserAccess)} apiConnected={apiConnected} canEdit={canManageUsers} />}
+            {reportViewKeys[view] && <Reports key={view} systemDate={state.systemProfile?.tglSystem} initialReportKey={reportViewKeys[view]} transactions={visibleTransactions} state={state} apiConnected={apiConnected} loadReport={loadReport} exportReport={exportReport} setDetail={openTransactionDetail} />}
+          </>}
         </main>
       </div>
       {detail && <TransactionDetail transaction={detail} accounts={state.accounts} close={() => setDetail(null)} onApprove={async () => { if (!await askApprovalConfirmation('APPROVED', 1, 'transaksi ini')) return; await runAction(() => detail.isOpeningBalance ? setOpeningBalanceStatus([detail.id], 'APPROVED') : detail.isManualTransaction ? setManualTransactionStatus([detail.id], 'APPROVED') : setTransactionStatus([detail.id], 'APPROVED'))(); }} onReject={async () => { const reason = await askRejectionReason('transaksi ini'); if (!reason) return; await runAction(() => detail.isOpeningBalance ? setOpeningBalanceStatus([detail.id], 'REJECTED', reason) : detail.isManualTransaction ? setManualTransactionStatus([detail.id], 'REJECTED', reason) : setTransactionStatus([detail.id], 'REJECTED', reason))(); }} onReconcileConfirm={confirmReconciliation} onReconcileReject={rejectReconciliation} />}
       {modal?.type === 'request' && <RequestModal close={() => setModal(null)} onSubmit={runAction(submitRequest)} loading={actionLoading} transactionTypes={state.transactionTypes || transactionTypeSeed} accounts={state.accounts || []} businessTypes={state.businessTypes || []} branches={state.branches || []} />}
-      {modal?.type === 'transaction' && <TransactionModal close={() => setModal(null)} onSubmit={runAction(submitTransaction)} loading={actionLoading} accounts={state.accounts} requests={state.requests} transactionTypes={state.transactionTypes || transactionTypeSeed} initialRequest={modal.request} />}
-      {modal?.type === 'mutation' && <MutationModal close={() => setModal(null)} onSubmit={runAction(modal.request ? submitRequestPayment : submitMutation)} loading={actionLoading} accounts={state.accounts} businessTypes={state.businessTypes || []} transactionTypes={state.transactionTypes || transactionTypeSeed} initialRequest={modal.request} />}
-      {modal?.type === 'opening-balance' && <OpeningBalanceModal close={() => setModal(null)} onSubmit={runAction(submitOpeningBalance)} loading={actionLoading} accounts={state.accounts} openingBalances={state.openingBalances} />}
+      {modal?.type === 'transaction' && <TransactionModal systemDate={state.systemProfile?.tglSystem} close={() => setModal(null)} onSubmit={runAction(submitTransaction)} loading={actionLoading} accounts={state.accounts} requests={state.requests} transactionTypes={state.transactionTypes || transactionTypeSeed} initialRequest={modal.request} />}
+      {modal?.type === 'mutation' && <MutationModal systemDate={state.systemProfile?.tglSystem} close={() => setModal(null)} onSubmit={runAction(modal.request ? submitRequestPayment : submitMutation)} loading={actionLoading} accounts={state.accounts} businessTypes={state.businessTypes || []} transactionTypes={state.transactionTypes || transactionTypeSeed} initialRequest={modal.request} />}
+      {modal?.type === 'opening-balance' && <OpeningBalanceModal systemDate={state.systemProfile?.tglSystem} close={() => setModal(null)} onSubmit={runAction(submitOpeningBalance)} loading={actionLoading} accounts={state.accounts} openingBalances={state.openingBalances} />}
       {modal?.type === 'manual-transaction' && <ManualTransactionModal close={() => setModal(null)} onSubmit={runAction(submitManualTransaction)} loading={actionLoading} accounts={state.accounts} transactionTypes={state.transactionTypes || transactionTypeSeed} />}
       {modal?.type === 'bank' && <BankModal close={() => setModal(null)} onSubmit={runAction(submitBank)} loading={actionLoading} initialItem={modal.item} />}
       {modal?.type === 'business-type' && <BusinessTypeModal close={() => setModal(null)} onSubmit={runAction(submitBusinessType)} loading={actionLoading} initialItem={modal.item} />}
@@ -1399,12 +1455,36 @@ function PeriodClosePage({ systemProfile, onClosePeriod, apiConnected }) {
   </>;
 }
 
+function PeriodBlockedOverlay({ status, onOpenClose }) {
+  const closeDate = status?.closeDate || status?.systemDate || todayJakarta();
+  const actualDate = status?.actualDate || todayJakarta();
+  return <section className="period-gate" role="status">
+    <div className="period-gate-inner">
+      <div className="period-gate-art"><span className="period-gate-orbit" /><img src="/period-close-finance.png" alt="Ilustrasi penutupan periode" /></div>
+      <div className="period-gate-copy">
+        <span className="section-kicker">Periode belum ditutup</span>
+        <h1>Transaksi sementara dikunci</h1>
+        <p>Periode sampai <strong>{closeDate}</strong> belum ditutup. Tutup periode terlebih dahulu sebelum membuat transaksi baru atau mengambil transaksi dari sumber.</p>
+        <div className="period-gate-action">
+          <div className="period-gate-info"><span>Tanggal sistem</span><strong>{closeDate}</strong><small>Hari berjalan: {actualDate}</small></div>
+          <button className="button button-primary" type="button" onClick={onOpenClose}><CalendarDays size={16} />Tutup Periode</button>
+        </div>
+      </div>
+    </div>
+  </section>;
+}
+
 function StatCard({ icon: Icon, label, value, note, accent = '' }) {
   return <div className={`stat-card ${accent}`}><div className="stat-icon"><Icon size={19} /></div><div><span>{label}</span><strong>{value}</strong><small>{note}</small></div></div>;
 }
 
 function todayJakarta() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+function businessDate(systemDate = '') {
+  const value = String(systemDate || '').slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : todayJakarta();
 }
 
 function matchesDateRange(value, dateFrom, dateTo) {
@@ -1436,24 +1516,25 @@ function BusinessFilterBar({ value, onChange, options }) {
   return <div className="business-filter-bar"><label className="filter-field"><span>Jenis bisnis</span><select value={value || ''} onChange={(event) => onChange(event.target.value)}><option value="">Semua jenis bisnis</option>{options.map((option) => <option key={option} value={option}>{businessDisplayName(option)}</option>)}</select></label></div>;
 }
 
-function reportDateDefaults() {
-  const today = todayJakarta();
+function reportDateDefaults(systemDate) {
+  const today = businessDate(systemDate);
   return { dateFrom: today, dateTo: today, kodeToko: '', bentukSaldo: '' };
 }
 
-function dashboardDateDefaults() {
-  const today = todayJakarta();
+function dashboardDateDefaults(systemDate) {
+  const today = businessDate(systemDate);
   return { dateFrom: `${today.slice(0, 4)}-01-01`, dateTo: `${today.slice(0, 4)}-12-31`, kodeToko: '', bentukSaldo: '' };
 }
 
-function Dashboard({ state, pendingTransactions, pendingManualTransactions = [], setView, setDetail, apiConnected, loadReport }) {
+function Dashboard({ state, systemDate, pendingTransactions, pendingManualTransactions = [], setView, setDetail, apiConnected, loadReport }) {
   const accounts = state.accounts || [];
   const openingBalances = state.openingBalances || [];
   const transactions = state.transactions || [];
-  const [filters, setFilters] = useState(dashboardDateDefaults);
+  const [filters, setFilters] = useState(() => dashboardDateDefaults(systemDate));
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  useEffect(() => setFilters(dashboardDateDefaults(systemDate)), [systemDate]);
   useEffect(() => {
     if (!apiConnected) return;
     let active = true;
@@ -1492,7 +1573,15 @@ function Dashboard({ state, pendingTransactions, pendingManualTransactions = [],
   const period = data.period || fallback.period;
   const operations = data.operations || fallback.operations;
   const flowData = report?.flow || buildDailyCashFlow(transactions);
-  const categoryData = report?.categories || buildCategoryBreakdown('NAGAGOLD', transactions, accounts);
+  const categoriesByUnit = report?.categoriesByUnit || {};
+  const categoryDataFor = (unit) => {
+    if (Array.isArray(categoriesByUnit[unit])) return categoriesByUnit[unit];
+    if (unit === 'NAGAGOLD' && Array.isArray(report?.categories)) return report.categories;
+    return buildCategoryBreakdown(unit, transactions, accounts);
+  };
+  const nagagoldCategoryData = categoryDataFor('NAGAGOLD');
+  const optikCategoryData = categoryDataFor('OPTIK');
+  const showOptikCategory = optikCategoryData.length > 0;
   const fallbackBusinessGroups = [...new Map([
     ...(state.businessTypes || []).filter((item) => item.isActive !== false).map((item) => [String(item.code || '').toUpperCase(), { code: String(item.code || '').toUpperCase(), name: item.name || item.code || '' }]),
     ...scopedAccounts.map((item) => { const code = String(item.jenisBisnisCode || item.unitType || '').toUpperCase(); return [code, { code, name: code }]; }),
@@ -1510,13 +1599,13 @@ function Dashboard({ state, pendingTransactions, pendingManualTransactions = [],
   const updateFilter = (key, value) => setFilters((current) => ({ ...current, [key]: value }));
   const pendingForActivity = [...pendingTransactions, ...pendingManualTransactions];
   return <>
-    <PageHeader eyebrow="Ringkasan Finance" title="Dashboard Finance" description="Posisi saldo confirmed dan aktivitas Finance–Nagagold pada periode yang dipilih." action={<div className="page-actions"><button className="button button-secondary" type="button" onClick={() => setFilters(dashboardDateDefaults())}><RefreshCw size={16} />Tahun ini</button></div>} />
+    <PageHeader eyebrow="Ringkasan Finance" title="Dashboard Finance" description="Posisi saldo confirmed dan aktivitas Finance–Nagagold pada periode yang dipilih." action={<div className="page-actions"><button className="button button-secondary" type="button" onClick={() => setFilters(dashboardDateDefaults(systemDate))}><RefreshCw size={16} />Tahun ini</button></div>} />
     <section className="report-filter-panel"><div className="report-filter-heading"><div><span className="section-kicker">Filter laporan</span><strong>Periode, cabang, dan bentuk penyimpanan</strong></div>{loading && <span className="loading-label">Memuat data...</span>}</div><div className="report-filter-grid"><label className="filter-field"><span>Dari tanggal</span><input type="date" value={filters.dateFrom} onChange={(event) => updateFilter('dateFrom', event.target.value)} /></label><label className="filter-field"><span>Sampai tanggal</span><input type="date" value={filters.dateTo} onChange={(event) => updateFilter('dateTo', event.target.value)} /></label><label className="filter-field"><span>Cabang</span><SearchableSelect value={filters.kodeToko} onChange={(value) => updateFilter('kodeToko', value)} options={[{ value: '', label: 'Semua cabang Nagagold' }, ...(state.branches || []).map((branch) => ({ value: branch.kodeToko, label: `${branch.kodeToko} · ${branch.namaToko}` }))]} placeholder="Semua cabang Nagagold" /></label><label className="filter-field"><span>Bentuk penyimpanan</span><select value={filters.bentukSaldo} onChange={(event) => updateFilter('bentukSaldo', event.target.value)}><option value="">Semua</option><option value="KAS_TUNAI">Tunai</option><option value="REKENING_BANK">Non Tunai</option></select></label></div></section>
     {error && <div className="error-strip"><XCircle size={17} /><span>{error}</span></div>}
     <div className="dashboard-summary-grid dashboard-summary-grid-five">{summaryCards.map((card) => <StatCard key={card.key} icon={card.icon} label={card.label} value={formatRupiah(card.value)} note={card.note} accent={card.accent} />)}</div>
     <div className="report-mini-grid"><div><span>Penerimaan confirmed</span><strong>{formatRupiah(period.totalPenerimaan)}</strong></div><div><span>Pengeluaran confirmed</span><strong>{formatRupiah(period.totalPengeluaran)}</strong></div><div><span>Mutasi antar kas</span><strong>{formatRupiah(period.totalMutasiAntarKas)}</strong></div><div><span>{storageLabel ? `Akun ${storageLabel}` : 'Akun terdaftar'}</span><strong>{report ? balanceRows.length : scopedAccounts.length}</strong><small>{storageLabel ? `Akun ${storageLabel.toLowerCase()} yang dipilih` : 'Seluruh akun aktif'}</small></div></div>
     <section className="panel table-panel dashboard-table-panel"><div className="table-heading"><div><span className="section-kicker">Saldo rekening</span><h2>Saldo setiap rekening Kas Kecil</h2></div><span className="count-label">{smallAccounts.length} rekening</span></div><div className="table-wrap"><table><thead><tr><th>Kode akun</th><th>Nama kas/rekening</th><th>Cabang</th><th>Jenis akun</th><th>Saldo</th><th>Rekonsiliasi master</th></tr></thead><tbody>{smallAccounts.map((row) => <tr key={row.rekeningId}><td className="mono">{row.kodeAkun || '-'}</td><td><strong className="table-primary">{row.namaRekening || '-'}</strong></td><td>{row.kodeToko || row.unit || '-'}</td><td><span className="type-chip">{String(row.jenisAkun || '').replaceAll('_', ' ')}</span></td><td><strong className="amount-cell">{formatRupiah(row.saldoDashboard ?? row.saldoTersimpan ?? row.saldoAkhir)}</strong></td><td><span className={`status-badge ${row.rekonsiliasiSaldo === 'SELISIH' ? 'status-rejected' : 'status-approved'}`}><span className="status-dot" />{row.rekonsiliasiSaldo || 'Terukur'}</span></td></tr>)}</tbody></table>{smallAccounts.length === 0 && <EmptyState title="Belum ada rekening Kas Kecil" description="Rekening Nagagold akan tampil setelah tersedia di master rekening." />}</div></section>
-    <div className="dashboard-visual-grid"><DashboardFlowChart data={flowData} granularity={report?.flowGranularity} /><CategoryDonut unit="NAGAGOLD" items={categoryData} /></div><section className="panel dashboard-flow-panel"><div className="table-heading"><div><span className="section-kicker">Aktivitas periode</span><h2>Penerimaan dan pengeluaran confirmed</h2></div><span className="count-label">{period.confirmedTransactions} transaksi</span></div><div className="report-flow-summary"><div><span className="flow-dot flow-in" /><strong>{formatRupiah(period.totalPenerimaan)}</strong><small>Penerimaan</small></div><div><span className="flow-dot flow-out" /><strong>{formatRupiah(period.totalPengeluaran)}</strong><small>Pengeluaran</small></div><div><span className="flow-dot flow-neutral" /><strong>{formatRupiah(period.totalMutasiAntarKas)}</strong><small>Mutasi internal</small></div></div></section>
+    <div className="dashboard-visual-grid dashboard-visual-grid-single"><DashboardFlowChart data={flowData} granularity={report?.flowGranularity} /></div><div className="dashboard-category-grid"><CategoryDonut unit="NAGAGOLD" items={nagagoldCategoryData} />{showOptikCategory && <CategoryDonut unit="OPTIK" items={optikCategoryData} />}</div><section className="panel dashboard-flow-panel"><div className="table-heading"><div><span className="section-kicker">Aktivitas periode</span><h2>Penerimaan dan pengeluaran confirmed</h2></div><span className="count-label">{period.confirmedTransactions} transaksi</span></div><div className="report-flow-summary"><div><span className="flow-dot flow-in" /><strong>{formatRupiah(period.totalPenerimaan)}</strong><small>Penerimaan</small></div><div><span className="flow-dot flow-out" /><strong>{formatRupiah(period.totalPengeluaran)}</strong><small>Pengeluaran</small></div><div><span className="flow-dot flow-neutral" /><strong>{formatRupiah(period.totalMutasiAntarKas)}</strong><small>Mutasi internal</small></div></div></section>
     <section className="panel operational-panel"><div className="table-heading"><div><span className="section-kicker">Monitoring operasional</span><h2>Hal yang perlu diperhatikan</h2></div>{REPORT_MENU_KEYS.includes('reports-transactions') && <button className="text-button" type="button" onClick={() => setView('reports-transactions')}>Buka laporan <ChevronRight size={15} /></button>}</div><div className="operational-grid"><button type="button" onClick={() => setView('requests')}><strong>{operations.pendingRequests}</strong><span>Request menunggu approval</span></button><button type="button" onClick={() => setView('requests')}><strong>{operations.approvedUnpaidRequests}</strong><span>Approved belum ditransfer</span></button><button type="button" onClick={() => setView('verification')}><strong>{operations.pendingManual}</strong><span>Transaksi manual pending</span></button><button type="button" onClick={() => setView('nagagold-transactions')}><strong>{operations.needsReview}</strong><span>Integrasi perlu review</span></button><button type="button" onClick={() => setView('nagagold-mapping')}><strong>{operations.mappingFailed}</strong><span>Gagal mapping</span></button>{REPORT_MENU_KEYS.includes('reports-reconciliation') && <button type="button" onClick={() => setView('reports-reconciliation')}><strong>{operations.reconciliationConflicts}</strong><span>Konflik rekonsiliasi</span></button>}</div></section>
     <div className="dashboard-grid"><section className="panel activity-panel"><div className="panel-heading"><div><span className="section-kicker">Approval terbaru</span><h2>Perlu perhatian Owner</h2></div><button className="text-button" type="button" onClick={() => setView('verification')}>Lihat semua <ChevronRight size={15} /></button></div>{pendingForActivity.slice(0, 3).map((item) => <button className="activity-row" key={item.id} type="button" onClick={() => setDetail(item)}><span className="activity-icon"><ArrowUpRight size={17} /></span><span className="activity-copy"><strong>{(item.jenisRequest || item.jenisTransaksi || 'Transaksi').replaceAll('_', ' ')}</strong><small>{item.kodeToko || item.rekeningName || ''} · {item.transactionNumber}</small></span><span className="activity-amount"><strong>{formatRupiah(item.amount)}</strong><small>{formatDate(item.transactionDate)}</small></span><ChevronRight size={16} /></button>)}{pendingForActivity.length === 0 && <EmptyState title="Tidak ada transaksi pending" description="Semua transaksi sudah diproses." />}</section><section className="panel tree-panel"><div className="panel-heading"><div><span className="section-kicker">Struktur kas</span><h2>Hierarki akun aktif</h2></div><button className="text-button" type="button" onClick={() => setView('accounts')}>Kelola <ChevronRight size={15} /></button></div><MiniTree accounts={accounts} /></section></div>
   </>;
@@ -1619,13 +1708,14 @@ function approvalCategory(item) {
   return 'TRANSAKSI';
 }
 
-function Verification({ transactions, openingBalances, manualTransactions = [], accounts, setDetail, actionLoading = false, onApproveCombined, onRejectCombined }) {
+function Verification({ systemDate, transactions, openingBalances, manualTransactions = [], accounts, setDetail, actionLoading = false, onApproveCombined, onRejectCombined }) {
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState('PENDING_APPROVAL');
   const [unitFilter, setUnitFilter] = useState('ALL');
   const [categoryFilter, setCategoryFilter] = useState('ALL');
-  const [dateFrom, setDateFrom] = useState(todayJakarta);
-  const [dateTo, setDateTo] = useState(todayJakarta);
+  const defaultDate = businessDate(systemDate);
+  const [dateFrom, setDateFrom] = useState(defaultDate);
+  const [dateTo, setDateTo] = useState(defaultDate);
   const [selectedKeys, setSelectedKeys] = useState([]);
   const transactionRows = transactions.filter((item) => {
     const approvalStatus = item.approvalStatus || item.approval_status;
@@ -1654,18 +1744,21 @@ function Verification({ transactions, openingBalances, manualTransactions = [], 
   const toggleAll = () => { if (!actionLoading) setSelectedKeys(allSelected ? [] : approvalRows.map((row) => row.key)); };
   const toggleOne = (key) => { if (!actionLoading) setSelectedKeys((current) => current.includes(key) ? current.filter((item) => item !== key) : [...current, key]); };
   const decisionPayload = () => ({ transactionIds: selectedRows.filter((row) => row.kind === 'TRANSACTION').map((row) => row.id), openingIds: selectedRows.filter((row) => row.kind === 'OPENING_BALANCE').map((row) => row.id), manualIds: selectedRows.filter((row) => row.kind === 'MANUAL_TRANSACTION').map((row) => row.id) });
-  const clearFilters = () => { const today = todayJakarta(); setSearchText(''); setStatusFilter('PENDING_APPROVAL'); setUnitFilter('ALL'); setCategoryFilter('ALL'); setDateFrom(today); setDateTo(today); };
+  useEffect(() => { setDateFrom(defaultDate); setDateTo(defaultDate); }, [defaultDate]);
+  const clearFilters = () => { setSearchText(''); setStatusFilter('PENDING_APPROVAL'); setUnitFilter('ALL'); setCategoryFilter('ALL'); setDateFrom(defaultDate); setDateTo(defaultDate); };
   const openDetail = (row) => {
     if (row.kind === 'TRANSACTION' || row.kind === 'MANUAL_TRANSACTION') return setDetail(row.item);
     return setDetail({ ...row.item, id: row.id, isOpeningBalance: true, transactionNumber: 'SALDO AWAL', jenisTransaksi: 'SALDO AWAL', kategoriSistem: 'SALDO AWAL', kategori_sistem: 'SALDO AWAL', kategoriTransaksi: 'SALDO AWAL', amount: row.item.amount, transactionDate: row.item.date, status: row.item.status, approvalStatus: row.item.status, journalStatus: row.item.status === 'APPROVED' ? 'POSTED' : 'PROVISIONAL', sourceType: 'MANUAL_ADMIN', sourceTypeLabel: 'Saldo awal', sourceAccountId: row.item.rekeningId, destinationAccountId: '', note: row.item.note });
   };
-  return <><PageHeader eyebrow="Approval Center" title="Approval Center" description="Satu antrean untuk transaksi yang membutuhkan persetujuan Owner." action={<span className="live-pill"><span />Data tersinkron</span>} /><div className="info-strip"><ClipboardCheck size={18} /><span><strong>{approvalRows.length} data</strong> menunggu keputusan Owner.</span></div><section className="panel table-panel"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={setDateFrom} onDateToChange={setDateTo} /><Toolbar value={searchText} onChange={setSearchText} searchLabel="Cari approval" placeholder="Kategori, nomor transaksi, atau rekening..."><label className="filter-field"><span>Status</span><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="ALL">Semua status</option><option value="PENDING_APPROVAL">Menunggu approval</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option></select></label><label className="filter-field"><span>Kategori sistem</span><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="ALL">Semua kategori</option><option value="SALDO AWAL">Saldo awal</option><option value="MUTASI">Mutasi</option><option value="TRANSAKSI">Transaksi</option></select></label><label className="filter-field"><span>Unit bisnis</span><select value={unitFilter} onChange={(event) => setUnitFilter(event.target.value)}><option value="ALL">Semua unit</option><option value="NAGAGOLD">Nagagold</option><option value="OPTIK">Optik</option><option value="PUSAT">Pusat</option></select></label>{(searchText || statusFilter !== 'PENDING_APPROVAL' || unitFilter !== 'ALL' || categoryFilter !== 'ALL' || dateFrom !== todayJakarta() || dateTo !== todayJakarta()) && <button className="filter-clear" type="button" onClick={clearFilters}><X size={14} />Bersihkan</button>}</Toolbar>{selectedRows.length > 0 && <div className="bulk-bar"><span><strong>{selectedRows.length}</strong> data dipilih</span><div><button className="button button-approve" type="button" disabled={actionLoading} aria-busy={actionLoading} onClick={async () => { const confirmed = await onApproveCombined(decisionPayload()); if (confirmed !== false) setSelectedKeys([]); }}>{actionLoading ? <Spinner /> : <Check size={15} />}{actionLoading ? 'Memproses...' : 'Approve Terpilih'}</button><button className="button button-reject" type="button" disabled={actionLoading} aria-busy={actionLoading} onClick={async () => { const confirmed = await onRejectCombined(decisionPayload()); if (confirmed !== false) setSelectedKeys([]); }}>{actionLoading ? <Spinner /> : <X size={15} />}{actionLoading ? 'Memproses...' : 'Reject Terpilih'}</button></div></div>}<div className="table-wrap"><table><thead><tr><th className="checkbox-cell"><input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={actionLoading} aria-label="Pilih semua data pending" /></th><th>Kategori sistem</th><th>Transaksi</th><th>{hasSourceBranch ? 'Rekening / Cabang sumber' : 'Rekening'}</th><th>Nominal</th><th>Tanggal</th><th>Status</th><th /></tr></thead><tbody>{rows.map((row) => { const item = row.item; const canApprove = row.status === 'PENDING_APPROVAL'; const sourceType = row.kind === 'TRANSACTION' ? getSourceType(item) : ''; const isSynced = sourceType.startsWith('SYNC'); const accountId = row.kind === 'OPENING_BALANCE' ? item.rekeningId : (item.destinationAccountId || item.rekeningId || item.sourceAccountId); const accountLabel = accountDisplayLabel(accounts, accountId, item.rekeningName || item.destinationAccountName || item.sourceAccountName); const accountSecondary = row.kind === 'OPENING_BALANCE' || row.kind === 'MANUAL_TRANSACTION' ? '' : (isSynced ? `Cabang: ${item.kodeToko || '-'}${item.namaToko ? ` · ${item.namaToko}` : ''}` : 'Rekening tujuan'); const sourceLabel = row.kind === 'OPENING_BALANCE' ? 'Master saldo awal' : row.kind === 'MANUAL_TRANSACTION' ? 'Finance · Penyesuaian saldo' : (sourceType === 'SYNC_NAGAGOLD' ? `Nagagold · ${item.kategoriSumber || 'Kategori sumber belum terbaca'}` : (item.jenisTransaksi || 'Finance')); const showSourceLabel = Boolean(sourceLabel) && sourceLabel.replaceAll('_', ' ').toUpperCase() !== String(row.category || '').toUpperCase(); return <tr key={row.key}><td className="checkbox-cell">{canApprove && <input type="checkbox" checked={selectedKeys.includes(row.key)} onChange={() => toggleOne(row.key)} disabled={actionLoading} aria-label={`Pilih ${row.label}`} />}</td><td><span className="type-chip">{row.category}</span>{showSourceLabel && <small className="table-secondary">{sourceLabel}</small>}</td><td><strong className="table-primary">{row.kind === 'OPENING_BALANCE' ? 'SALDO AWAL' : row.label}</strong><small className="table-secondary">{row.kind === 'OPENING_BALANCE' ? (item.note || 'Pembukaan saldo rekening') : (item.note || item.jenisRequest ? String(item.note || item.jenisRequest).replaceAll('_', ' ') : 'Input Finance')}</small></td><td><strong className="table-primary">{accountLabel}</strong>{accountSecondary && <small className="table-secondary">{accountSecondary}</small>}</td><td><strong className="amount-cell">{formatRupiah(item.amount)}</strong></td><td>{formatDate(row.kind === 'OPENING_BALANCE' ? item.date : item.transactionDate)}</td><td><Badge status={row.status} /></td><td><button className="row-action" type="button" onClick={() => openDetail(row)} disabled={actionLoading}><Eye size={16} />Detail</button></td></tr>; })}</tbody></table>{rows.length === 0 && <EmptyState title="Tidak ada data approval" description="Tidak ada transaksi yang sesuai dengan filter saat ini." />}</div></section></>;
+  return <><PageHeader eyebrow="Approval Center" title="Approval Center" description="Satu antrean untuk transaksi yang membutuhkan persetujuan Owner." action={<span className="live-pill"><span />Data tersinkron</span>} /><div className="info-strip"><ClipboardCheck size={18} /><span><strong>{approvalRows.length} data</strong> menunggu keputusan Owner.</span></div><section className="panel table-panel"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={setDateFrom} onDateToChange={setDateTo} /><Toolbar value={searchText} onChange={setSearchText} searchLabel="Cari approval" placeholder="Kategori, nomor transaksi, atau rekening..."><label className="filter-field"><span>Status</span><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="ALL">Semua status</option><option value="PENDING_APPROVAL">Menunggu approval</option><option value="APPROVED">Approved</option><option value="REJECTED">Rejected</option></select></label><label className="filter-field"><span>Kategori sistem</span><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option value="ALL">Semua kategori</option><option value="SALDO AWAL">Saldo awal</option><option value="MUTASI">Mutasi</option><option value="TRANSAKSI">Transaksi</option></select></label><label className="filter-field"><span>Unit bisnis</span><select value={unitFilter} onChange={(event) => setUnitFilter(event.target.value)}><option value="ALL">Semua unit</option><option value="NAGAGOLD">Nagagold</option><option value="OPTIK">Optik</option><option value="PUSAT">Pusat</option></select></label>{(searchText || statusFilter !== 'PENDING_APPROVAL' || unitFilter !== 'ALL' || categoryFilter !== 'ALL' || dateFrom !== defaultDate || dateTo !== defaultDate) && <button className="filter-clear" type="button" onClick={clearFilters}><X size={14} />Bersihkan</button>}</Toolbar>{selectedRows.length > 0 && <div className="bulk-bar"><span><strong>{selectedRows.length}</strong> data dipilih</span><div><button className="button button-approve" type="button" disabled={actionLoading} aria-busy={actionLoading} onClick={async () => { const confirmed = await onApproveCombined(decisionPayload()); if (confirmed !== false) setSelectedKeys([]); }}>{actionLoading ? <Spinner /> : <Check size={15} />}{actionLoading ? 'Memproses...' : 'Approve Terpilih'}</button><button className="button button-reject" type="button" disabled={actionLoading} aria-busy={actionLoading} onClick={async () => { const confirmed = await onRejectCombined(decisionPayload()); if (confirmed !== false) setSelectedKeys([]); }}>{actionLoading ? <Spinner /> : <X size={15} />}{actionLoading ? 'Memproses...' : 'Reject Terpilih'}</button></div></div>}<div className="table-wrap"><table><thead><tr><th className="checkbox-cell"><input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={actionLoading} aria-label="Pilih semua data pending" /></th><th>Kategori sistem</th><th>Transaksi</th><th>{hasSourceBranch ? 'Rekening / Cabang sumber' : 'Rekening'}</th><th>Nominal</th><th>Tanggal</th><th>Status</th><th /></tr></thead><tbody>{rows.map((row) => { const item = row.item; const canApprove = row.status === 'PENDING_APPROVAL'; const sourceType = row.kind === 'TRANSACTION' ? getSourceType(item) : ''; const isSynced = sourceType.startsWith('SYNC'); const accountId = row.kind === 'OPENING_BALANCE' ? item.rekeningId : (item.destinationAccountId || item.rekeningId || item.sourceAccountId); const accountLabel = accountDisplayLabel(accounts, accountId, item.rekeningName || item.destinationAccountName || item.sourceAccountName); const accountSecondary = row.kind === 'OPENING_BALANCE' || row.kind === 'MANUAL_TRANSACTION' ? '' : (isSynced ? `Cabang: ${item.kodeToko || '-'}${item.namaToko ? ` · ${item.namaToko}` : ''}` : 'Rekening tujuan'); const sourceLabel = row.kind === 'OPENING_BALANCE' ? 'Master saldo awal' : row.kind === 'MANUAL_TRANSACTION' ? 'Finance · Penyesuaian saldo' : (sourceType === 'SYNC_NAGAGOLD' ? `Nagagold · ${item.kategoriSumber || 'Kategori sumber belum terbaca'}` : (item.jenisTransaksi || 'Finance')); const showSourceLabel = Boolean(sourceLabel) && sourceLabel.replaceAll('_', ' ').toUpperCase() !== String(row.category || '').toUpperCase(); return <tr key={row.key}><td className="checkbox-cell">{canApprove && <input type="checkbox" checked={selectedKeys.includes(row.key)} onChange={() => toggleOne(row.key)} disabled={actionLoading} aria-label={`Pilih ${row.label}`} />}</td><td><span className="type-chip">{row.category}</span>{showSourceLabel && <small className="table-secondary">{sourceLabel}</small>}</td><td><strong className="table-primary">{row.kind === 'OPENING_BALANCE' ? 'SALDO AWAL' : row.label}</strong><small className="table-secondary">{row.kind === 'OPENING_BALANCE' ? (item.note || 'Pembukaan saldo rekening') : (item.note || item.jenisRequest ? String(item.note || item.jenisRequest).replaceAll('_', ' ') : 'Input Finance')}</small></td><td><strong className="table-primary">{accountLabel}</strong>{accountSecondary && <small className="table-secondary">{accountSecondary}</small>}</td><td><strong className="amount-cell">{formatRupiah(item.amount)}</strong></td><td>{formatDate(row.kind === 'OPENING_BALANCE' ? item.date : item.transactionDate)}</td><td><Badge status={row.status} /></td><td><button className="row-action" type="button" onClick={() => openDetail(row)} disabled={actionLoading}><Eye size={16} />Detail</button></td></tr>; })}</tbody></table>{rows.length === 0 && <EmptyState title="Tidak ada data approval" description="Tidak ada transaksi yang sesuai dengan filter saat ini." />}</div></section></>;
 }
 
-function Requests({ requests, openCreate, openTransaction, onAcceptRequest, onRejectRequest, onApproveRequest, onRejectApprovedRequest }) {
+function Requests({ systemDate, requests, openCreate, openTransaction, onAcceptRequest, onRejectRequest, onApproveRequest, onRejectApprovedRequest }) {
   const [expandedRequests, setExpandedRequests] = useState([]);
-  const [dateFrom, setDateFrom] = useState(todayJakarta);
-  const [dateTo, setDateTo] = useState(todayJakarta);
+  const defaultDate = businessDate(systemDate);
+  const [dateFrom, setDateFrom] = useState(defaultDate);
+  const [dateTo, setDateTo] = useState(defaultDate);
+  useEffect(() => { setDateFrom(defaultDate); setDateTo(defaultDate); }, [defaultDate]);
   const [businessFilter, setBusinessFilter] = useState('');
   const requestBusiness = (item) => businessFilterValue(item, 'FINANCE');
   const businessOptions = businessFilterOptions(requests, 'FINANCE');
@@ -1707,11 +1800,13 @@ function IntegrationStatusBadge({ status, label }) {
   return <span className={`status-badge ${classes[status] || 'status-pending'}`}><span className="status-dot" />{label || humanStatus(status) || 'Perlu diperiksa'}</span>;
 }
 
-function NagagoldTransactionsSimple({ transactions, syncStatus, branches, accounts, setDetail, onSync, apiConnected }) {
+function NagagoldTransactionsSimple({ systemDate, transactions, syncStatus, branches, accounts, setDetail, onSync, apiConnected }) {
   const [expandedTransactions, setExpandedTransactions] = useState([]);
   const [searchText, setSearchText] = useState('');
-  const [dateFrom, setDateFrom] = useState(todayJakarta);
-  const [dateTo, setDateTo] = useState(todayJakarta);
+  const defaultDate = businessDate(systemDate);
+  const [dateFrom, setDateFrom] = useState(defaultDate);
+  const [dateTo, setDateTo] = useState(defaultDate);
+  useEffect(() => { setDateFrom(defaultDate); setDateTo(defaultDate); }, [defaultDate]);
   const [businessFilter, setBusinessFilter] = useState('');
   const [syncLoading, setSyncLoading] = useState(false);
   const transactionBusiness = (item) => businessFilterValue(item, 'FINANCE');
@@ -1732,13 +1827,14 @@ function NagagoldTransactionsSimple({ transactions, syncStatus, branches, accoun
     <section className="panel table-panel"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={setDateFrom} onDateToChange={setDateTo} businessValue={businessFilter} onBusinessChange={setBusinessFilter} businessOptions={businessOptions} /><div className="table-heading"><div><span className="section-kicker">Data transaksi sumber</span><h2>Transaksi Terintegrasi</h2></div><span className="count-label">{visibleTransactions.length} transaksi</span></div><Toolbar value={searchText} onChange={setSearchText} searchLabel="Cari transaksi" placeholder="Referensi, faktur, cabang, rekening, atau keterangan..." /><div className="table-wrap"><table><thead><tr><th className="expand-cell" /><th>Referensi sumber</th><th>Sumber</th><th>Cabang</th><th>Nominal</th><th>Arah</th><th>Kategori</th><th>Pembayaran</th><th>Rekening Finance</th><th>Status integrasi</th><th /></tr></thead><tbody>{visibleTransactions.map((item) => { const expanded = expandedTransactions.includes(item.id); const incoming = item.arahDana === 'MASUK'; const status = item.integrationStatus || 'NEEDS_REVIEW'; const invoices = item.sourceInvoiceDetails?.length ? item.sourceInvoiceDetails : (item.detail_faktur || []).map((number) => ({ no_faktur: number })); const sourceLabel = item.jenisBisnis || item.jenis_bisnis || (String(item.sourceSystem || '').toUpperCase() === 'OPTIK' ? 'OPTIK' : 'NAGAGOLD'); return <React.Fragment key={item.id}><tr><td className="expand-cell"><button className="row-action" type="button" onClick={() => toggle(item.id)} aria-label="Buka detail transaksi">{expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</button></td><td><strong className="table-primary mono">{item.sourceNoReff || item.sourceId || '-'}</strong><small className="table-secondary">{item.sourceInvoiceNumbers?.length ? item.sourceInvoiceNumbers.join(', ') : 'Tanpa nomor faktur'}</small></td><td><span className="type-chip">{sourceLabel}</span></td><td><strong className="table-primary">{item.kodeToko || '-'}</strong><small className="table-secondary">{item.namaToko || '-'}</small></td><td><strong className="amount-cell">{formatRupiah(item.amount)}</strong></td><td><span className="type-chip">{incoming ? 'Masuk' : 'Keluar'}</span></td><td><span className="type-chip">{item.kategori || item.kategoriSumber || '-'}</span></td><td>{item.jenis_pembayaran || item.sourcePaymentMethod || item.source_payment_method || '-'}</td><td><strong className="table-primary">{item.rekeningName || accountName(accounts, item.rekeningId)}</strong></td><td><IntegrationStatusBadge status={status} label={item.integrationStatusLabel} /></td><td><button className="row-action" type="button" onClick={() => setDetail(item)}><Eye size={16} />Detail</button></td></tr>{expanded && <tr className="expanded-row"><td colSpan="11"><div className="expand-panel"><div className="expand-grid"><DetailLine label="Sumber" value={sourceLabel} /><DetailLine label="Kategori" value={item.kategori || item.kategoriSumber || '-'} /><DetailLine label="Jenis pembayaran" value={item.jenis_pembayaran || item.sourcePaymentMethod || item.source_payment_method || '-'} /><DetailLine label="Rekening Finance" value={item.rekeningName || accountName(accounts, item.rekeningId)} /><DetailLine label="Status integrasi" value={item.integrationStatusLabel || 'Perlu diperiksa'} /><DetailLine label="No. keuangan" value={item.no_keuangan || '-'} /><DetailLine label="Referensi sumber" value={item.sourceNoReff || item.sourceId || '-'} /><DetailLine label="Request ID" value={item.requestId || '-'} /><DetailLine label="Keterangan" value={item.note || item.sourceKeterangan || '-'} /><DetailLine label="Catatan proses" value={item.integrationReason || item.sync_message || '-'} /></div><div className="invoice-detail-list"><strong>Detail faktur</strong>{invoices.length ? <table><thead><tr><th>No. faktur</th><th>Jenis</th><th>Nominal</th></tr></thead><tbody>{invoices.map((invoice) => <tr key={`${item.id}-${invoice.no_faktur || invoice.nomorFaktur}`}><td>{invoice.no_faktur || invoice.nomorFaktur}</td><td>{invoice.jenis_faktur || invoice.jenisFaktur || '-'}</td><td>{formatRupiah(invoice.nominal ?? invoice.nilaiFaktur ?? 0)}</td></tr>)}</tbody></table> : <span>Tidak ada detail faktur.</span>}</div></div></td></tr>}</React.Fragment>; })}</tbody></table>{visibleTransactions.length === 0 && <EmptyState title="Belum ada transaksi terintegrasi" description="Data akan muncul setelah sinkronisasi berhasil mengambil data dari sistem cabang." />}</div></section></>;
 }
 
-function NagagoldTransactionsCompact({ transactions, syncStatus, branches, accounts, onValidate, onDryRun, onSnapshotRecoveryPreview, onApplySnapshotRecovery, canApplySnapshotRecovery, setDetail, onRefresh, apiConnected }) {
+function NagagoldTransactionsCompact({ systemDate, transactions, syncStatus, branches, accounts, onValidate, onDryRun, onSnapshotRecoveryPreview, onApplySnapshotRecovery, canApplySnapshotRecovery, setDetail, onRefresh, apiConnected }) {
   const [expandedTransactions, setExpandedTransactions] = useState([]);
   const [searchText, setSearchText] = useState('');
   const [reconciliationFilter, setReconciliationFilter] = useState('ALL');
   const [classificationFilter, setClassificationFilter] = useState('ALL');
-  const [dateFrom, setDateFrom] = useState(todayJakarta);
-  const [dateTo, setDateTo] = useState(todayJakarta);
+  const defaultDate = businessDate(systemDate);
+  const [dateFrom, setDateFrom] = useState(defaultDate);
+  const [dateTo, setDateTo] = useState(defaultDate);
   const [dryRun, setDryRun] = useState(null);
   const [dryRunLoading, setDryRunLoading] = useState(false);
   const [recoveryPreview, setRecoveryPreview] = useState(null);
@@ -1923,11 +2019,11 @@ function OpeningBalances({ items, accounts, openCreate }) {
   return <><PageHeader eyebrow="Saldo Rekening" title="Saldo Awal" description="Catat saldo awal setiap rekening sebelum digunakan untuk transaksi." action={<button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />Input Saldo Awal</button>} /><div className="info-strip"><WalletCards size={18} /><span>Saldo awal yang baru dicatat akan diverifikasi Owner melalui <strong>Approval Center</strong>.</span></div><section className="panel table-panel"><div className="table-heading"><div><span className="section-kicker">Daftar saldo awal</span><h2>Saldo rekening</h2></div><span className="count-label">{items.length} data</span></div><div className="table-wrap"><table><thead><tr><th>Rekening</th><th>Tanggal</th><th>Nilai</th><th>Keterangan</th><th>Status</th></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong className="table-primary">{item.rekeningName || accountName(accounts, item.rekeningId)}</strong></td><td>{formatDate(item.date)}</td><td><strong className="amount-cell">{formatRupiah(item.amount)}</strong></td><td>{item.note || '-'}</td><td><Badge status={item.status} /></td></tr>)}</tbody></table>{items.length === 0 && <EmptyState title="Belum ada saldo awal" description="Input saldo awal untuk mulai memakai rekening." />}</div></section></>;
 }
 
-function OpeningBalanceModal({ close, onSubmit, accounts, openingBalances = [], loading = false }) {
+function OpeningBalanceModal({ systemDate, close, onSubmit, accounts, openingBalances = [], loading = false }) {
   const activeOpeningAccountIds = new Set(openingBalances.filter((item) => ['PENDING_APPROVAL', 'APPROVED'].includes(String(item.status || '').toUpperCase())).map((item) => String(item.rekeningId || item.rekening_id || '')));
   const usableAccounts = accounts.filter((account) => account.isActive && !activeOpeningAccountIds.has(String(account.id || account._id || '')) && (account.accountType === 'REKENING' || account.bentukSaldo === 'KAS_TUNAI' || account.accountNumber || account.bankId));
-  const systemDate = todayJakarta();
-  const [form, setForm] = useState(() => ({ rekeningId: '', date: systemDate, amount: '', note: '' }));
+  const defaultDate = businessDate(systemDate);
+  const [form, setForm] = useState(() => ({ rekeningId: '', date: defaultDate, amount: '', note: '' }));
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   return <Modal title="Input Saldo Awal" eyebrow="Saldo rekening" close={close}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSubmit(form); }}><Field label="Rekening" full><SearchableSelect required value={form.rekeningId} onChange={(value) => update('rekeningId', value)} placeholder="Pilih rekening" options={usableAccounts.map((account) => ({ value: account.id, label: accountOptionLabel(account) }))} />{usableAccounts.length === 0 && <small className="form-note">Semua rekening aktif sudah memiliki saldo awal atau sedang menunggu approval.</small>}</Field><Field label="Tanggal saldo (tanggal sistem)"><input required disabled type="date" value={form.date} aria-readonly="true" /></Field><Field label="Saldo awal (Rp)"><input required type="text" inputMode="numeric" value={formatInputRupiah(form.amount)} onChange={(event) => update('amount', digitsOnly(event.target.value))} placeholder="Rp 0" /></Field><Field label="Keterangan" full><textarea rows="3" value={form.note} onChange={(event) => update('note', event.target.value.toUpperCase())} placeholder="Contoh: Saldo rekening saat mulai menggunakan sistem" /></Field><FormActions close={close} submitLabel="Simpan & Kirim Approval" /></form></Modal>;
 }
@@ -2127,7 +2223,7 @@ function financialGroupDescendants(groups, groupId) {
   return result;
 }
 
-function Reports({ transactions, state, apiConnected, loadReport, exportReport, setDetail, initialReportKey = 'transactions' }) {
+function Reports({ systemDate, transactions, state, apiConnected, loadReport, exportReport, setDetail, initialReportKey = 'transactions' }) {
   const reportKey = initialReportKey;
   const sourceReportKeys = ['nagagold-source', 'nagagold-cash', 'nagagold-accounts'];
   const reportConfigs = {
@@ -2144,8 +2240,9 @@ function Reports({ transactions, state, apiConnected, loadReport, exportReport, 
     reconciliation: { title: 'Rekonsiliasi', description: 'Pemeriksaan mapping, pasangan transaksi, klasifikasi, dan jurnal Nagagold.', filters: ['period', 'branch', 'search', 'mapping', 'reconciliation', 'classification', 'journal'] },
   };
   const config = reportConfigs[reportKey] || reportConfigs.transactions;
-  const createFilters = () => ({ ...reportDateDefaults(), postingDateFrom: '', postingDateTo: '', search: '', sourceType: '', jenisTransaksi: '', kategoriSumber: '', kategoriKeuangan: '', metodePembayaran: '', statusSumber: '', sourceFinalityStatus: '', approvalStatus: '', journalStatus: '', syncStatus: '', reconciliationStatus: '', mappingStatus: '', classificationStatus: '', status: '', paymentStatus: '', journalType: '', accountId: '', unit: '', kelompokKasId: '', includeSubgroups: true, includeEmptyAccounts: false, detailDirection: '', nomorKeuangan: '', nomorTransaksi: '', keterangan: '', groupBy: 'CASH_GROUP', view: 'summary', page: 1, pageSize: 25 });
+  const createFilters = () => ({ ...reportDateDefaults(systemDate), postingDateFrom: '', postingDateTo: '', search: '', sourceType: '', jenisTransaksi: '', kategoriSumber: '', kategoriKeuangan: '', metodePembayaran: '', statusSumber: '', sourceFinalityStatus: '', approvalStatus: '', journalStatus: '', syncStatus: '', reconciliationStatus: '', mappingStatus: '', classificationStatus: '', status: '', paymentStatus: '', journalType: '', accountId: '', unit: '', kelompokKasId: '', includeSubgroups: true, includeEmptyAccounts: false, detailDirection: '', nomorKeuangan: '', nomorTransaksi: '', keterangan: '', groupBy: 'CASH_GROUP', view: 'summary', page: 1, pageSize: 25 });
   const [filters, setFilters] = useState(createFilters);
+  useEffect(() => setFilters(createFilters()), [systemDate]);
   const appliedFilters = filters;
   const [payload, setPayload] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -2251,9 +2348,11 @@ function TreeNodes({ accounts, parentId, compact = false }) {
   return <>{accounts.filter((item) => (item.parentId || null) === (parentId || null)).map((account) => <div className="tree-node-wrap" key={account.id}><div className={`tree-node ${compact ? 'compact' : ''}`}><span className="tree-chevron">{accounts.some((item) => item.parentId === account.id) ? <ChevronDown size={14} /> : <span />}</span><span className={`tree-symbol ${account.accountType.toLowerCase()}`}>{account.accountType === 'REKENING' ? <CreditCard size={15} /> : account.accountType === 'KAS_KECIL' ? <Store size={15} /> : account.accountType === 'KAS_BESAR' ? <Building2 size={15} /> : <Landmark size={15} />}</span><span className="tree-copy"><strong>{account.name}</strong><small>{account.bankName || account.unitType || ''}</small></span><span className="tree-type">{account.accountType.replace('KAS_', '').replace('REKENING', 'REK')}</span></div><TreeNodes accounts={accounts} parentId={account.id} compact={compact} /></div>)}</>;
 }
 
-function Mutations({ transactions, accounts, openCreate, setDetail }) {
-  const [dateFrom, setDateFrom] = useState(todayJakarta);
-  const [dateTo, setDateTo] = useState(todayJakarta);
+function Mutations({ systemDate, transactions, accounts, openCreate, setDetail }) {
+  const defaultDate = businessDate(systemDate);
+  const [dateFrom, setDateFrom] = useState(defaultDate);
+  const [dateTo, setDateTo] = useState(defaultDate);
+  useEffect(() => { setDateFrom(defaultDate); setDateTo(defaultDate); }, [defaultDate]);
   const rows = transactions.filter((item) => {
     if (item.isImported === true || !matchesDateRange(item.transactionDate || item.tanggal || item.date || item.createdAt, dateFrom, dateTo)) return false;
     return String(item.kategoriSistem || item.kategori_sistem || '').toUpperCase() === 'MUTASI'
@@ -2265,14 +2364,14 @@ function Mutations({ transactions, accounts, openCreate, setDetail }) {
   return <><PageHeader eyebrow="Transaksi Keuangan" title="Mutasi Rekening / Kas" description="Pindahkan dana antar rekening atau kas melalui satu alur approval dan jurnal yang sama." action={<button className="button button-primary" type="button" onClick={openCreate}><Plus size={16} />Tambah Mutasi</button>} /><div className="info-strip"><ArrowLeftRight size={18} /><span>Pilih sumber dan tujuan secara bertahap. Mutasi langsung memengaruhi saldo dengan jurnal provisional; Owner mengesahkan atau membuat jurnal balik jika ditolak.</span></div><section className="panel table-panel"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={setDateFrom} onDateToChange={setDateTo} /><div className="table-heading"><div><span className="section-kicker">Riwayat mutasi</span><h2>Mutasi rekening dan kas</h2></div><span className="count-label">{rows.length} transaksi</span></div><div className="table-wrap"><table><thead><tr><th>Nomor</th><th>Tanggal</th><th>Dari</th><th>Ke</th><th>Jenis transaksi</th><th>Nominal</th><th>Approval</th><th>Jurnal</th><th /></tr></thead><tbody>{rows.map((item) => <tr key={item.id}><td><strong className="table-primary">{item.transactionNumber}</strong><small className="table-secondary">Mutasi internal</small></td><td>{formatDate(item.transactionDate)}</td><td>{accountName(accounts, item.sourceAccountId)}</td><td>{accountName(accounts, item.destinationAccountId)}</td><td>{String(item.jenisTransaksi || '-').replaceAll('_', ' ')}</td><td><strong className="amount-cell">{formatRupiah(item.amount)}</strong></td><td><Badge status={item.approvalStatus || item.status} /></td><td><Badge status={item.journalStatus || 'PROVISIONAL'} /></td><td><button className="row-action" type="button" onClick={() => setDetail(item)}><Eye size={16} />Detail</button></td></tr>)}</tbody></table>{rows.length === 0 && <EmptyState title="Belum ada mutasi" description="Tidak ada mutasi pada rentang tanggal yang dipilih." />}</div></section></>;
 }
 
-function MutationModal({ close, onSubmit, accounts, businessTypes, transactionTypes, initialRequest = null, loading = false }) {
+function MutationModal({ systemDate, close, onSubmit, accounts, businessTypes, transactionTypes, initialRequest = null, loading = false }) {
   const storageOptions = [{ code: 'REKENING_BANK', label: 'REKENING BANK' }, { code: 'KAS_TUNAI', label: 'TUNAI' }];
   const cashLevelOptions = [{ code: 'KAS_UTAMA', label: 'KAS UTAMA' }, { code: 'KAS_BESAR', label: 'KAS BESAR' }, { code: 'KAS_KECIL', label: 'KAS KECIL' }];
   const activeBusinessTypes = businessTypes.filter((item) => item.isActive !== false);
   const legacyBusinessTypes = [...new Set(accounts.map((item) => String(item.jenisBisnisCode || item.unitType || '').trim().toUpperCase()).filter((code) => code && !['PUSAT', 'BERSAMA'].includes(code)))].map((code) => ({ code, name: code }));
   const businesses = [...activeBusinessTypes, ...legacyBusinessTypes.filter((legacy) => !activeBusinessTypes.some((item) => String(item.code || '').toUpperCase() === legacy.code))];
   const activeTransactionTypes = transactionTypes.filter((item) => item.isActive !== false);
-  const today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Jakarta' }).format(new Date());
+  const today = businessDate(systemDate);
   const getStorage = (account) => account.bentukSaldo || (String(account.bankCode || account.bankName || '').toUpperCase() === 'TUNAI' ? 'KAS_TUNAI' : 'REKENING_BANK');
   const getCashLevel = (account) => account.jenisKas || account.posKasType || '';
   const getBusiness = (account) => String(account.jenisBisnisCode || account.unitType || '').toUpperCase();
@@ -2391,7 +2490,7 @@ function RequestModal({ close, onSubmit, transactionTypes, accounts, businessTyp
 
 function TransactionModalLegacy({ close, onSubmit, accounts, requests, transactionTypes, initialRequest }) { const availableTransactionTypes = transactionTypes.filter((item) => item.isActive); const usableAccounts = accounts.filter((account) => account.isActive && (account.accountType === 'REKENING' || account.accountNumber || account.bankId)); const kasBesarIds = new Set(accounts.filter((account) => account.accountType === 'KAS_BESAR').map((account) => account.id)); const kasKecilIds = new Set(accounts.filter((account) => account.accountType === 'KAS_KECIL').map((account) => account.id)); const requestOrigin = String(initialRequest?.asalPermintaan || initialRequest?.asal_permintaan || (initialRequest?.kodeToko ? 'CABANG' : 'INTERNAL')).toUpperCase(); const isInternalRequest = Boolean(initialRequest) && requestOrigin === 'INTERNAL'; const sourceAccounts = isInternalRequest ? usableAccounts : usableAccounts.filter((account) => account.accountType === 'KAS_BESAR' || kasBesarIds.has(account.parentId)); const destinationAccounts = isInternalRequest ? usableAccounts.filter((account) => !initialRequest?.destinationAccountId || account.id === initialRequest.destinationAccountId) : usableAccounts.filter((account) => account.accountType === 'KAS_KECIL' || kasKecilIds.has(account.parentId)); const selectedRequestType = initialRequest?.jenisTransaksi || initialRequest?.jenisRequest || ''; const [form, setForm] = useState({ requestId: initialRequest?.requestId || '', transactionDate: todayJakarta(), transferDate: todayJakarta(), transferReference: '', transferProof: '', paymentNote: '', jenisTransaksi: selectedRequestType || availableTransactionTypes.find((item) => item.code === 'TRANSFER_INTERNAL')?.code || availableTransactionTypes[0]?.code || '', kodeToko: initialRequest?.kodeToko || '', sourceAccountId: initialRequest?.sourceAccountId || '', destinationAccountId: initialRequest?.destinationAccountId || '', amount: initialRequest?.nilaiRp || '', note: initialRequest?.tujuan || '' }); const isRequestPayment = Boolean(form.requestId); const update = (key, value) => setForm((current) => ({ ...current, [key]: value })); return <Modal title={isRequestPayment ? 'Realisasi Permintaan Dana' : 'Input Transaksi'} eyebrow="Transfer Rekening" close={close}><form className="form-grid" onSubmit={(event) => { event.preventDefault(); onSubmit(form); }}><Field label="Berdasarkan request"><select value={form.requestId} disabled={Boolean(initialRequest)} onChange={(event) => { const request = requests.find((item) => item.requestId === event.target.value); update('requestId', event.target.value); if (request) setForm((current) => ({ ...current, jenisTransaksi: request.jenisTransaksi || request.jenisRequest || '', kodeToko: request.kodeToko, sourceAccountId: request.sourceAccountId || '', destinationAccountId: request.destinationAccountId || '', amount: request.nilaiRp, note: request.tujuan })); }}><option value="">Input manual</option>{requests.filter((item) => ['APPROVED', 'WAITING_TRANSFER'].includes(item.status)).map((item) => <option key={item.requestId} value={item.requestId}>{item.requestId} · {item.pemohonLabel || item.kodeToko || 'INTERNAL FINANCE'}</option>)}</select></Field><Field label="Tanggal transfer"><input type="date" required value={form.transactionDate} onChange={(event) => update('transactionDate', event.target.value)} /></Field>{isRequestPayment && <><Field label="Tanggal transfer terealisasi"><input type="date" required value={form.transferDate} onChange={(event) => update('transferDate', event.target.value)} /></Field><Field label="Nomor referensi transfer (opsional)"><input value={form.transferReference} onChange={(event) => update('transferReference', event.target.value)} placeholder="Nomor referensi bank" /></Field><Field label="Catatan realisasi" full><textarea rows="2" value={form.paymentNote} onChange={(event) => update('paymentNote', event.target.value.toUpperCase())} /></Field></>}<Field label="Jenis transaksi"><select value={form.jenisTransaksi} onChange={(event) => update('jenisTransaksi', event.target.value)}>{availableTransactionTypes.map((item) => <option key={item.code} value={item.code}>{item.name}</option>)}</select></Field><Field label={isInternalRequest ? 'Rekening / kas sumber' : 'Rekening sumber (Kas Besar)'}><select required value={form.sourceAccountId} onChange={(event) => update('sourceAccountId', event.target.value)}><option value="">Pilih rekening atau kas sumber</option>{sourceAccounts.map((account) => <option key={account.id} value={account.id}>{accountOptionLabel(account)}</option>)}</select></Field><Field label={isInternalRequest ? 'Rekening / kas tujuan' : 'Rekening tujuan (Kas Kecil)'}><select required value={form.destinationAccountId} onChange={(event) => update('destinationAccountId', event.target.value)}><option value="">Pilih rekening atau kas tujuan</option>{destinationAccounts.map((account) => <option key={account.id} value={account.id}>{accountOptionLabel(account)}</option>)}</select></Field><Field label="Nominal (Rp)"><input required type="text" inputMode="numeric" value={formatInputRupiah(form.amount)} onChange={(event) => update('amount', digitsOnly(event.target.value))} placeholder="Rp 0" /></Field><Field label="Keterangan" full><textarea rows="3" value={form.note} onChange={(event) => update('note', event.target.value.toUpperCase())} /></Field><FormActions close={close} submitLabel={isRequestPayment ? 'Simpan & Posting Pembayaran' : 'Simpan & Kirim Approval'} /></form></Modal>; }
 
-function TransactionModal({ close, onSubmit, accounts, requests, transactionTypes, initialRequest }) {
+function TransactionModal({ systemDate, close, onSubmit, accounts, requests, transactionTypes, initialRequest }) {
   const availableTransactionTypes = transactionTypes.filter((item) => item.isActive);
   const usableAccounts = accounts.filter((account) => account.isActive && (account.accountType === 'REKENING' || account.accountNumber || account.bankId));
   const kasBesarIds = new Set(accounts.filter((account) => account.accountType === 'KAS_BESAR').map((account) => account.id));
@@ -2401,7 +2500,8 @@ function TransactionModal({ close, onSubmit, accounts, requests, transactionType
   const sourceAccounts = isInternalRequest ? usableAccounts : usableAccounts.filter((account) => account.accountType === 'KAS_BESAR' || kasBesarIds.has(account.parentId));
   const destinationAccounts = isInternalRequest ? usableAccounts.filter((account) => !initialRequest?.destinationAccountId || account.id === initialRequest.destinationAccountId) : usableAccounts.filter((account) => account.accountType === 'KAS_KECIL' || kasKecilIds.has(account.parentId));
   const selectedRequestType = initialRequest?.jenisTransaksi || initialRequest?.jenisRequest || '';
-  const [form, setForm] = useState({ requestId: initialRequest?.requestId || '', transactionDate: todayJakarta(), transferDate: todayJakarta(), transferReference: '', transferProof: '', paymentNote: '', jenisTransaksi: selectedRequestType || availableTransactionTypes.find((item) => item.code === 'TRANSFER_INTERNAL')?.code || availableTransactionTypes[0]?.code || '', kodeToko: initialRequest?.kodeToko || '', sourceAccountId: initialRequest?.sourceAccountId || '', destinationAccountId: initialRequest?.destinationAccountId || '', amount: initialRequest?.nilaiRp || '', note: initialRequest?.tujuan || '' });
+  const defaultDate = businessDate(systemDate);
+  const [form, setForm] = useState({ requestId: initialRequest?.requestId || '', transactionDate: defaultDate, transferDate: defaultDate, transferReference: '', transferProof: '', paymentNote: '', jenisTransaksi: selectedRequestType || availableTransactionTypes.find((item) => item.code === 'TRANSFER_INTERNAL')?.code || availableTransactionTypes[0]?.code || '', kodeToko: initialRequest?.kodeToko || '', sourceAccountId: initialRequest?.sourceAccountId || '', destinationAccountId: initialRequest?.destinationAccountId || '', amount: initialRequest?.nilaiRp || '', note: initialRequest?.tujuan || '' });
   const isRequestPayment = Boolean(form.requestId);
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const selectRequest = (requestId) => {
