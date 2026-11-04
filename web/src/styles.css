@@ -1898,6 +1898,12 @@ tbody tr:hover { background:rgba(0,0,0,.05); }
 .mapping-form-panel .mapping-form { row-gap:18px; }
 .searchable-select-menu { overflow:hidden; }
 .searchable-select-options { overscroll-behavior:contain; }
+.report-filter-grid .report-fetch-button { align-self:end; justify-content:center; gap:7px; min-height:38px; white-space:nowrap; }
+.report-loading-state { display:grid; min-height:220px; place-items:center; align-content:center; gap:9px; color:#6f828c; background:#fbfcfc; text-align:center; }
+.report-loading-state strong { color:#40545d; font-size:13px; }
+.report-loading-state span { font-size:11px; }
+.report-loading-spinner { width:30px; height:30px; border:3px solid #c9e5e1; border-top-color:#348fe2; border-radius:50%; animation:button-spin .7s linear infinite; }
+.report-idle-state svg { color:#90a4ad; }
 @media (max-width:1100px) { .topbar { left:220px; } .page-content { padding-right:24px; padding-left:24px; } }
 @media (max-width:760px) {
   .sidebar { top:0; }

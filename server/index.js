@@ -2080,6 +2080,20 @@ async function ensureSafeFinanceIndexes() {
     if (!duplicateBankAccounts) await Account.collection.createIndex({ bank_id: 1, nomor_rekening: 1 }, { unique: true, partialFilterExpression: { aktif: true, bentuk_saldo: 'REKENING_BANK' }, name: 'uniq_active_bank_account' });
     else console.warn('Index rekening bank unik ditunda karena ditemukan rekening fisik duplikat existing.');
   }
+  // tt_mutasi pernah memakai schema lama dengan field transactionNumber,
+  // requestId, transactionDate, dan metadata sinkronisasi. Index lama itu
+  // tidak lagi cocok dengan schema ringkas sekarang yang memakai no_mutasi,
+  // no_request, dan tanggal. Index unik transactionNumber_1 khususnya akan
+  // menganggap dokumen baru dengan field lama kosong sebagai duplikat.
+  const mutationIndexes = await FinanceMutation.collection.indexes();
+  const legacyMutationFields = new Set(['transactionNumber', 'requestId', 'transactionDate', 'isImported', 'kodeToko', 'sourceKey', 'finance_transaction_id']);
+  for (const index of mutationIndexes) {
+    const hasLegacyField = Object.keys(index.key || {}).some((field) => legacyMutationFields.has(field));
+    if (hasLegacyField && index.name !== '_id_') {
+      await FinanceMutation.collection.dropIndex(index.name);
+      console.info(`Index tt_mutasi lama ${index.name} dihapus; struktur kini memakai no_mutasi dan no_request.`);
+    }
+  }
   const duplicateLogicalJournals = await JournalEntry.collection.aggregate([
     { $match: { no_transaksi: { $exists: true, $ne: '' } } },
     { $group: { _id: { no_transaksi: '$no_transaksi', tipe: '$tipe' }, count: { $sum: 1 } } },
@@ -5120,13 +5134,19 @@ async function sendExcelExport(report, payload, res) {
       row.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
         const key = keys[columnNumber - 1];
         cell.alignment = { vertical: 'top', horizontal: isExportAmountKey(key) ? 'right' : 'left', wrapText: true };
-        cell.border = { bottom: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } } };
+        cell.border = {
+          top: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } },
+          bottom: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } },
+          left: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } },
+          right: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } },
+        };
         if (typeof cell.value === 'number') cell.numFmt = isExportAmountKey(key) ? '"Rp" #,##0;[Red]-"Rp" #,##0' : '#,##0';
       });
     }
-    sheet.views = [{ state: 'frozen', ySplit: headerRow.number }];
+    sheet.views = [{ state: 'frozen', ySplit: headerRow.number, activeCell: 'A1', showGridLines: false }];
     sheet.autoFilter = { from: { row: headerRow.number, column: 1 }, to: { row: headerRow.number, column: keys.length } };
     sheet.pageSetup = { paperSize: 9, orientation: keys.length > 7 ? 'landscape' : 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0, horizontalDpi: 300, verticalDpi: 300 };
+    sheet.pageSetup.printArea = `A1:${lastColumn}${sheet.rowCount}`;
     sheet.pageMargins = { left: 0.25, right: 0.25, top: 0.55, bottom: 0.55, header: 0.2, footer: 0.2 };
     sheet.printTitlesRow = `${headerRow.number}:${headerRow.number}`;
     sheet.headerFooter.oddFooter = '&LFinance Sambas&C&D&RHalaman &P dari &N';
@@ -5242,14 +5262,15 @@ async function sendPdfExport(report, payload, res) {
       document.font('Helvetica-Bold').fontSize(10).fillColor('#26343B').text(section.name, margin, document.y, { width: contentWidth });
       document.moveDown(0.45);
     }
-    if (rows.length) drawPdfTable(document, report, rows, Object.keys(rows[0]), margin, document.y, contentWidth);
+    if (rows.length) document.y = drawPdfTable(document, report, rows, Object.keys(rows[0]), margin, document.y, contentWidth);
   });
   const pages = document.bufferedPageRange();
   for (let index = 0; index < pages.count; index++) {
     document.switchToPage(index);
     document.moveTo(margin, document.page.height - 29).lineTo(document.page.width - margin, document.page.height - 29).strokeColor('#D5DBE0').lineWidth(.5).stroke();
-    document.font('Helvetica').fontSize(7).fillColor('#607780').text('Finance Sambas', margin, document.page.height - 22, { width: contentWidth / 2 });
-    document.text(`Halaman ${index + 1} dari ${pages.count}`, margin + contentWidth / 2, document.page.height - 22, { align: 'right', width: contentWidth / 2 });
+    const footerY = document.page.height - 22;
+    document.font('Helvetica').fontSize(7).fillColor('#607780').text('Finance Sambas', margin, footerY, { width: contentWidth / 2, height: 10, lineBreak: false });
+    document.text(`Halaman ${index + 1} dari ${pages.count}`, margin + contentWidth / 2, footerY, { align: 'right', width: contentWidth / 2, height: 10, lineBreak: false });
   }
   document.end();
 }
@@ -5272,7 +5293,18 @@ app.get('/api/notifications', asyncRoute(async (req, res) => {
 }));
 
 app.use((error, req, res, next) => {
-  if (error?.code === 11000) return res.status(409).json({ message: 'Data duplikat: kombinasi kode atau request ID sudah digunakan.' });
+  if (error?.code === 11000) {
+    const keyValue = error.keyValue || {};
+    const duplicateField = Object.keys(keyValue)[0] || '';
+    const duplicateMessage = duplicateField === 'no_mutasi' || duplicateField === 'transactionNumber'
+      ? 'Nomor mutasi sudah digunakan. Silakan coba simpan kembali.'
+      : duplicateField === 'requestId'
+        ? 'Request ID sudah memiliki data yang sama.'
+        : duplicateField === 'sourceKey'
+          ? 'Transaksi sumber sudah pernah disinkronkan.'
+          : 'Data duplikat tidak dapat disimpan. Periksa data yang sama.';
+    return res.status(409).json({ message: duplicateMessage, duplicateField });
+  }
   const status = error.status || 500;
   if (status >= 500) {
     if (process.env.NODE_ENV === 'production') console.error(`[${req.method} ${req.path}] ${error.message || 'Internal server error'}`);

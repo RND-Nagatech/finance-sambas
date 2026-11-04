@@ -1336,6 +1336,7 @@ function App() {
 
   if (API_BASE_URL && !authReady) return <main className="auth-loading"><FinanceMark size={40} /><span>Memuat Finance...</span></main>;
   if (API_BASE_URL && !session) return <LoginScreen onSubmit={handleLogin} error={authError} loading={authLoading} />;
+  if (API_BASE_URL && session && !hydrated) return <main className="auth-loading"><FinanceMark size={40} /><span>Menyiapkan data Finance...</span></main>;
 
   return (
     <ActionLoadingContext.Provider value={actionLoading}>
@@ -1368,7 +1369,7 @@ function App() {
             {view === 'transaction-types' && <MasterOptions title="Master Jenis Transaksi" eyebrow="Data Master" description="Kelola jenis kejadian keuangan yang digunakan pada transaksi Finance." items={state.transactionTypes || transactionTypeSeed} openCreate={() => setModal({ type: 'transaction-type' })} openEdit={(item) => setModal({ type: 'transaction-type', item })} onDelete={(item) => deleteMasterOption('transaction', item)} />}
             {view === 'users-data' && <UserDataPage users={state.users || []} openCreate={() => setModal({ type: 'user' })} openEdit={(item) => setModal({ type: 'user', item })} onToggle={toggleUser} apiConnected={apiConnected} canManageUsers={canManageUsers} />}
             {view === 'users-manage' && <UserAccessPage access={state.userAccess} onSave={runAction(saveUserAccess)} apiConnected={apiConnected} canEdit={canManageUsers} />}
-            {reportViewKeys[view] && <Reports key={view} systemDate={state.systemProfile?.tglSystem} initialReportKey={reportViewKeys[view]} transactions={visibleTransactions} state={state} apiConnected={apiConnected} loadReport={loadReport} exportReport={exportReport} setDetail={openTransactionDetail} />}
+            {reportViewKeys[view] && <Reports key={view} systemDate={state.systemProfile?.tglSystem} initialReportKey={reportViewKeys[view]} transactions={visibleTransactions} state={state} apiConnected={apiConnected} loadReport={loadReport} exportReport={exportReport} setDetail={openTransactionDetail} onNotice={showToast} />}
           </>}
         </main>
       </div>
@@ -2223,7 +2224,7 @@ function financialGroupDescendants(groups, groupId) {
   return result;
 }
 
-function Reports({ systemDate, transactions, state, apiConnected, loadReport, exportReport, setDetail, initialReportKey = 'transactions' }) {
+function Reports({ systemDate, transactions, state, apiConnected, loadReport, exportReport, setDetail, onNotice, initialReportKey = 'transactions' }) {
   const reportKey = initialReportKey;
   const sourceReportKeys = ['nagagold-source', 'nagagold-cash', 'nagagold-accounts'];
   const reportConfigs = {
@@ -2242,14 +2243,53 @@ function Reports({ systemDate, transactions, state, apiConnected, loadReport, ex
   const config = reportConfigs[reportKey] || reportConfigs.transactions;
   const createFilters = () => ({ ...reportDateDefaults(systemDate), postingDateFrom: '', postingDateTo: '', search: '', sourceType: '', jenisTransaksi: '', kategoriSumber: '', kategoriKeuangan: '', metodePembayaran: '', statusSumber: '', sourceFinalityStatus: '', approvalStatus: '', journalStatus: '', syncStatus: '', reconciliationStatus: '', mappingStatus: '', classificationStatus: '', status: '', paymentStatus: '', journalType: '', accountId: '', unit: '', kelompokKasId: '', includeSubgroups: true, includeEmptyAccounts: false, detailDirection: '', nomorKeuangan: '', nomorTransaksi: '', keterangan: '', groupBy: 'CASH_GROUP', view: 'summary', page: 1, pageSize: 25 });
   const [filters, setFilters] = useState(createFilters);
-  useEffect(() => setFilters(createFilters()), [systemDate]);
-  const appliedFilters = filters;
+  const [appliedFilterState, setAppliedFilterState] = useState(null);
+  const [hasFetched, setHasFetched] = useState(false);
   const [payload, setPayload] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const update = (key, value) => setFilters((current) => ({ ...current, [key]: value, ...(key === 'page' ? {} : { page: 1 }) }));
-  const reset = () => setFilters(createFilters());
-  const changePage = (page) => setFilters((current) => ({ ...current, page }));
+  useEffect(() => {
+    setFilters(createFilters());
+    setAppliedFilterState(null);
+    setPayload(null);
+    setHasFetched(false);
+    setError('');
+  }, [systemDate]);
+  const appliedFilters = appliedFilterState || filters;
+  const clearReportResult = () => {
+    setAppliedFilterState(null);
+    setPayload(null);
+    setHasFetched(false);
+    setError('');
+  };
+  const update = (key, value) => {
+    setFilters((current) => ({ ...current, [key]: value, ...(key === 'page' ? {} : { page: 1 }) }));
+    clearReportResult();
+  };
+  const updateMany = (changes) => {
+    setFilters((current) => ({ ...current, ...changes, page: 1 }));
+    clearReportResult();
+  };
+  const reset = () => {
+    setFilters(createFilters());
+    clearReportResult();
+  };
+  const fetchReport = (nextFilters = filters) => {
+    if (!apiConnected) {
+      setError('Backend laporan belum terhubung.');
+      return;
+    }
+    setPayload(null);
+    setError('');
+    setAppliedFilterState({ ...nextFilters });
+    setHasFetched(true);
+  };
+  const changePage = (page) => {
+    const nextFilters = { ...filters, page };
+    setFilters(nextFilters);
+    setAppliedFilterState(nextFilters);
+    setHasFetched(true);
+  };
   const cashGroups = financialGroupOptions(state.accounts || [], state.cashTypes || []);
   const visibleCashGroups = filters.unit ? cashGroups.filter((group) => !group.unit || String(group.unit).toUpperCase() === filters.unit) : cashGroups;
   const selectedGroupIds = filters.kelompokKasId && filters.includeSubgroups ? new Set(financialGroupDescendants(cashGroups, filters.kelompokKasId)) : filters.kelompokKasId ? new Set([filters.kelompokKasId]) : null;
@@ -2261,31 +2301,40 @@ function Reports({ systemDate, transactions, state, apiConnected, loadReport, ex
   });
   const businessOptions = [...new Set([...(state.businessTypes || []).filter((item) => item.isActive !== false).map((item) => item.code), ...(state.accounts || []).map((item) => item.unitType).filter(Boolean), 'PUSAT'])].sort();
   useEffect(() => {
+    if (!hasFetched || !appliedFilterState) {
+      setLoading(false);
+      return undefined;
+    }
     if (!apiConnected) { setPayload(null); return undefined; }
     let active = true;
     setLoading(true); setError('');
     const endpoint = reportKey === 'transactions' ? '/reports/transactions' : '/reports/' + reportKey;
-    loadReport(endpoint, filters).then((body) => { if (active) setPayload(body); }).catch((reason) => { if (active) { setPayload(null); setError(reason.message); } }).finally(() => { if (active) setLoading(false); });
+    loadReport(endpoint, appliedFilterState).then((body) => {
+      if (!active) return;
+      setPayload(body);
+      const resultCount = Number(body?.total ?? body?.rows?.length ?? body?.summaryRows?.length ?? body?.groupTree?.length ?? body?.groupRows?.length ?? 0);
+      if (resultCount === 0) onNotice?.('Data tidak tersedia untuk filter laporan yang dipilih.');
+    }).catch((reason) => { if (active) { setPayload(null); setError(reason.message); } }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [apiConnected, reportKey, filters.dateFrom, filters.dateTo, filters.postingDateFrom, filters.postingDateTo, filters.kodeToko, filters.bentukSaldo, filters.search, filters.sourceType, filters.jenisTransaksi, filters.kategoriSumber, filters.kategoriKeuangan, filters.metodePembayaran, filters.statusSumber, filters.sourceFinalityStatus, filters.approvalStatus, filters.journalStatus, filters.syncStatus, filters.reconciliationStatus, filters.mappingStatus, filters.classificationStatus, filters.status, filters.paymentStatus, filters.journalType, filters.accountId, filters.unit, filters.kelompokKasId, filters.includeSubgroups, filters.includeEmptyAccounts, filters.detailDirection, filters.nomorKeuangan, filters.nomorTransaksi, filters.keterangan, filters.groupBy, filters.view, filters.page]);
-  const fallbackRows = reportKey === 'transactions' ? transactions.map((item) => ({ id: item.id, transactionDate: item.transactionDate, postedDate: item.approvedAt || '', transactionNumber: item.transactionNumber, sourceType: getSourceType(item), sourceNoReff: item.sourceNoReff || '', requestId: item.requestId || '', kodeToko: item.kodeToko || '', jenisTransaksi: item.jenisTransaksi || '', amount: Number(item.amount || 0), confirmedAmount: item.status === 'APPROVED' ? Number(item.amount || 0) : 0, approvalStatus: item.approvalStatus || item.status, journalStatus: item.journalStatus || item.journal_status || '', syncStatus: item.syncStatus || item.sync_status || '', reconciliationStatus: item.reconciliationStatus || item.reconciliation_status || '' })) : [];
-  const fallbackFinancial = reportKey === 'financial' ? fallbackFinancialRows(state).filter((row) => (!appliedFilters.accountId || row.accountId === appliedFilters.accountId) && (!appliedFilters.kategoriKeuangan || row.category === appliedFilters.kategoriKeuangan) && (!appliedFilters.sourceType || row.source === appliedFilters.sourceType) && (!appliedFilters.search || financialSearchText(row).includes(appliedFilters.search.toLowerCase()))) : [];
+  }, [apiConnected, reportKey, hasFetched, appliedFilterState]);
+  const fallbackRows = hasFetched && reportKey === 'transactions' ? transactions.map((item) => ({ id: item.id, transactionDate: item.transactionDate, postedDate: item.approvedAt || '', transactionNumber: item.transactionNumber, sourceType: getSourceType(item), sourceNoReff: item.sourceNoReff || '', requestId: item.requestId || '', kodeToko: item.kodeToko || '', jenisTransaksi: item.jenisTransaksi || '', amount: Number(item.amount || 0), confirmedAmount: item.status === 'APPROVED' ? Number(item.amount || 0) : 0, approvalStatus: item.approvalStatus || item.status, journalStatus: item.journalStatus || item.journal_status || '', syncStatus: item.syncStatus || item.sync_status || '', reconciliationStatus: item.reconciliationStatus || item.reconciliation_status || '' })) : [];
+  const fallbackFinancial = hasFetched && reportKey === 'financial' ? fallbackFinancialRows(state).filter((row) => (!appliedFilters.accountId || row.accountId === appliedFilters.accountId) && (!appliedFilters.kategoriKeuangan || row.category === appliedFilters.kategoriKeuangan) && (!appliedFilters.sourceType || row.source === appliedFilters.sourceType) && (!appliedFilters.search || financialSearchText(row).includes(appliedFilters.search.toLowerCase()))) : [];
   const fallbackFinancialSummary = reportKey === 'financial' ? summarizeFinancialRows(fallbackFinancial, appliedFilters.groupBy) : [];
-  const rows = payload?.rows || (reportKey === 'financial' ? (appliedFilters.view === 'summary' ? fallbackFinancialSummary : fallbackFinancial) : fallbackRows);
-  const total = payload?.total ?? rows.length;
-  const totalPages = payload?.totalPages ?? 1;
-  const sourceSummary = sourceReportKeys.includes(reportKey) ? payload?.summary : null;
-  const groupRows = reportKey === 'balances' ? (payload?.groupRows || []) : [];
-  const financialSummary = reportKey === 'financial' ? (payload?.summary || { saldoAwal: fallbackFinancial.filter((row) => row.category === 'SALDO AWAL').reduce((sum, row) => sum + Number(row.debit || 0) - Number(row.credit || 0), 0), totalDebit: fallbackFinancial.reduce((sum, row) => sum + Number((row.reportDebit ?? row.debit) || 0), 0), totalKredit: fallbackFinancial.reduce((sum, row) => sum + Number((row.reportCredit ?? row.credit) || 0), 0), saldoAkhir: fallbackFinancial.reduce((sum, row) => sum + Number((row.reportDebit ?? row.debit) || 0) - Number((row.reportCredit ?? row.credit) || 0), 0) + fallbackFinancial.filter((row) => row.category === 'SALDO AWAL').reduce((sum, row) => sum + Number(row.debit || 0) - Number(row.credit || 0), 0) }) : null;
-  const financialTree = reportKey === 'financial' ? (payload?.groupTree || []) : [];
+  const rows = hasFetched ? (payload?.rows || (reportKey === 'financial' ? (appliedFilters.view === 'summary' ? fallbackFinancialSummary : fallbackFinancial) : fallbackRows)) : [];
+  const total = hasFetched ? (payload?.total ?? rows.length) : 0;
+  const totalPages = hasFetched ? (payload?.totalPages ?? 1) : 1;
+  const sourceSummary = hasFetched && sourceReportKeys.includes(reportKey) ? payload?.summary : null;
+  const groupRows = hasFetched && reportKey === 'balances' ? (payload?.groupRows || []) : [];
+  const financialSummary = hasFetched && reportKey === 'financial' ? (payload?.summary || { saldoAwal: fallbackFinancial.filter((row) => row.category === 'SALDO AWAL').reduce((sum, row) => sum + Number(row.debit || 0) - Number(row.credit || 0), 0), totalDebit: fallbackFinancial.reduce((sum, row) => sum + Number((row.reportDebit ?? row.debit) || 0), 0), totalKredit: fallbackFinancial.reduce((sum, row) => sum + Number((row.reportCredit ?? row.credit) || 0), 0), saldoAkhir: fallbackFinancial.reduce((sum, row) => sum + Number((row.reportDebit ?? row.debit) || 0) - Number((row.reportCredit ?? row.credit) || 0), 0) + fallbackFinancial.filter((row) => row.category === 'SALDO AWAL').reduce((sum, row) => sum + Number(row.debit || 0) - Number(row.credit || 0), 0) }) : null;
+  const financialTree = hasFetched && reportKey === 'financial' ? (payload?.groupTree || []) : [];
   const financialGroupRows = (() => { const result = []; const visit = (nodes) => (nodes || []).forEach((node) => { if (node.rowType === 'GROUP') result.push(node); visit(node.children); visit(node.accounts); }); visit(financialTree); return result; })();
   const renderInput = (key, label, type = 'text', placeholder = '') => <label key={key} className="filter-field"><span>{label}</span><input type={type} value={filters[key] || ''} onChange={(event) => update(key, event.target.value)} placeholder={placeholder} /></label>;
   const renderSelect = (key, label, options) => <label key={key} className="filter-field"><span>{label}</span><SearchableSelect value={filters[key] || ''} onChange={(value) => update(key, value)} options={options.map(([value, text]) => ({ value, label: text }))} placeholder={options.find(([value]) => value === '')?.[1] || `Pilih ${label.toLowerCase()}`} /></label>;
   const renderFilter = (filter) => {
     if (filter === 'financialView') return renderSelect('view', 'Tampilan laporan', [['summary', 'Rekap'], ['detail', 'Detail']]);
     if (filter === 'period') return [renderInput('dateFrom', 'Tanggal dari', 'date'), renderInput('dateTo', 'Tanggal sampai', 'date')];
-    if (filter === 'business') return <label key={filter} className="filter-field"><span>Unit bisnis</span><SearchableSelect value={filters.unit || ''} onChange={(value) => setFilters((current) => ({ ...current, unit: value, kelompokKasId: '', accountId: '', page: 1 }))} options={[{ value: '', label: 'Semua unit' }, ...businessOptions.map((item) => ({ value: item, label: item.replaceAll('_', ' ') }))]} placeholder="Semua unit" /></label>;
-    if (filter === 'cashGroup') return <label key={filter} className="filter-field"><span>Kelompok kas</span><SearchableSelect value={filters.kelompokKasId || ''} onChange={(value) => setFilters((current) => ({ ...current, kelompokKasId: value, accountId: '', page: 1 }))} options={[{ value: '', label: 'Semua kelompok kas' }, ...visibleCashGroups.map((item) => ({ value: item.id, label: item.label }))]} placeholder="Semua kelompok kas" /></label>;
+    if (filter === 'business') return <label key={filter} className="filter-field"><span>Unit bisnis</span><SearchableSelect value={filters.unit || ''} onChange={(value) => updateMany({ unit: value, kelompokKasId: '', accountId: '' })} options={[{ value: '', label: 'Semua unit' }, ...businessOptions.map((item) => ({ value: item, label: item.replaceAll('_', ' ') }))]} placeholder="Semua unit" /></label>;
+    if (filter === 'cashGroup') return <label key={filter} className="filter-field"><span>Kelompok kas</span><SearchableSelect value={filters.kelompokKasId || ''} onChange={(value) => updateMany({ kelompokKasId: value, accountId: '' })} options={[{ value: '', label: 'Semua kelompok kas' }, ...visibleCashGroups.map((item) => ({ value: item.id, label: item.label }))]} placeholder="Semua kelompok kas" /></label>;
     if (filter === 'financialOptions') return filters.view === 'summary'
       ? <React.Fragment key={filter}><label className="filter-field"><span>Pengelompokan</span><select value={filters.groupBy} onChange={(event) => update('groupBy', event.target.value)}><option value="CASH_GROUP">Per Kelompok Kas</option><option value="ACCOUNT">Per Rekening</option><option value="UNIT">Per Unit Bisnis</option><option value="BRANCH">Per Toko / Cabang</option></select></label>{filters.groupBy === 'ACCOUNT' && <label className="filter-check"><input type="checkbox" checked={Boolean(filters.includeEmptyAccounts)} onChange={(event) => update('includeEmptyAccounts', event.target.checked)} /><span title="Menampilkan rekening tanpa transaksi dan saldo">Tampilkan rekening kosong</span></label>}</React.Fragment>
       : <React.Fragment key={filter}><label className="filter-field"><span>Jenis transaksi</span><SearchableSelect value={filters.jenisTransaksi || ''} onChange={(value) => update('jenisTransaksi', value)} options={[{ value: '', label: 'Semua jenis' }, ...(state.transactionTypes || transactionTypeSeed).filter((item) => item.isActive !== false).map((item) => ({ value: item.code, label: item.name }))]} placeholder="Semua jenis" /></label>{renderSelect('detailDirection', 'Arah transaksi', [['', 'Semua arah'], ['DEBET', 'Debet / uang masuk'], ['KREDIT', 'Kredit / uang keluar']])}{renderInput('search', 'Pencarian', 'text', 'No. keuangan, no. transaksi, rekening, atau keterangan')}</React.Fragment>;
@@ -2314,6 +2363,7 @@ function Reports({ systemDate, transactions, state, apiConnected, loadReport, ex
   const drilldown = (row, categoryCode = '') => {
     const next = { ...filters, view: 'detail', accountId: row.rowType === 'ACCOUNT' ? row.accountId : '', kelompokKasId: row.rowType === 'GROUP' && row.groupId ? row.groupId : filters.kelompokKasId, includeSubgroups: row.rowType === 'GROUP' ? true : filters.includeSubgroups, kategoriKeuangan: categoryCode, detailDirection: '', page: 1 };
     setFilters(next);
+    clearReportResult();
   };
   const openFinancialDetail = (row) => setDetail({ ...row, id: row.openingBalanceId || row.transactionId || row.id, isOpeningBalance: Boolean(row.openingBalanceId), transactionDate: row.date, amount: Math.max(Number(row.debit || 0), Number(row.credit || 0)), sourceAccountId: row.accountId, note: row.description, status: 'APPROVED', approvalStatus: 'APPROVED', journalStatus: row.journalStatus || 'POSTED' });
   const summaryAmount = (row, field, categoryCode = '') => <button className="report-number-button" type="button" onClick={() => drilldown(row, categoryCode)}>{formatRupiah(row[field] || 0)}</button>;
@@ -2338,7 +2388,51 @@ function Reports({ systemDate, transactions, state, apiConnected, loadReport, ex
   };
   const balanceSummary = reportKey === 'balances' && payload?.summary;
   const displayedReportTitle = appliedFilters.view === 'summary' && reportKey === 'financial' ? 'Rekap' : appliedFilters.view === 'detail' && reportKey === 'financial' ? 'Detail' : config.title;
-  return <><PageHeader eyebrow="Laporan" title={config.title} description={config.description} action={<div className="page-actions report-export-actions"><button className="button export-button export-excel" type="button" onClick={() => exportReport(reportKey, appliedFilters, 'xlsx')} disabled={!apiConnected}><FileSpreadsheet size={16} />Export Excel</button><button className="button export-button export-pdf" type="button" onClick={() => exportReport(reportKey, appliedFilters, 'pdf')} disabled={!apiConnected}><FileText size={16} />Export PDF</button></div>} /><div className="report-page-shell">{sourceSummary && <div className="report-summary"><div><span>Uang masuk sumber</span><strong>{formatRupiah(sourceSummary.totalMonitoringIn)}</strong><small>Monitoring tt_cash_daily</small></div><div><span>Uang keluar sumber</span><strong>{formatRupiah(sourceSummary.totalMonitoringOut)}</strong><small>{sourceSummary.totalEvents || 0} event sumber</small></div><div><span>Net confirmed</span><strong>{formatRupiah(sourceSummary.netConfirmed)}</strong><small>{sourceSummary.matchedExcluded || 0} data matched dikecualikan</small></div></div>}{financialSummary && <div className="report-summary financial-summary"><div><span>Saldo awal periode</span><strong>{formatRupiah(financialSummary.saldoAwal)}</strong><small>{appliedFilters.dateFrom}</small></div><div><span>Total debet</span><strong>{formatRupiah(financialSummary.totalDebit)}</strong><small>Transaksi tercatat, tidak termasuk saldo awal</small></div><div><span>Total kredit</span><strong>{formatRupiah(financialSummary.totalKredit)}</strong><small>Transaksi tercatat, tidak termasuk saldo awal</small></div><div><span>Saldo akhir periode</span><strong>{formatRupiah(financialSummary.saldoAkhir)}</strong><small>{appliedFilters.dateTo}</small></div></div>}{financialSummary?.unclassifiedCount > 0 && <div className="info-strip report-warning"><XCircle size={17} /><span>{financialSummary.unclassifiedCount} baris belum terklasifikasi. Nilainya tetap dihitung dalam saldo dan ditampilkan sebagai Koreksi (+/-).</span></div>}{balanceSummary && <div className="report-summary"><div><span>Saldo akhir</span><strong>{formatRupiah(balanceSummary.saldoAkhir)}</strong><small>{balanceSummary.totalAccounts || 0} akun</small></div><div><span>Akun selisih</span><strong>{balanceSummary.selisih || 0}</strong><small>Saldo tersimpan vs jurnal</small></div><div><span>Periode</span><strong>{appliedFilters.dateFrom}</strong><small>s.d. {appliedFilters.dateTo}</small></div></div>}<section className="panel report-workspace"><div className="report-filter-panel report-filter-panel-inline"><div className="report-filter-heading"><div><span className="section-kicker">Filter laporan</span><strong>{config.description}</strong></div><span className="count-label">{loading ? 'Memuat...' : String(total) + ' data'}</span></div><div className="report-filter-grid">{config.filters.flatMap(renderFilter)}<button className="filter-clear" type="button" onClick={reset}><X size={14} />Bersihkan filter</button></div></div><div className="table-heading report-table-heading"><div><span className="section-kicker">{displayedReportTitle}</span><h2>{loading ? 'Memuat laporan...' : String(total) + ' data'}</h2></div><span className="count-label">{(payload?.filters?.dateFrom || appliedFilters.dateFrom) + ' s.d. ' + (payload?.filters?.dateTo || appliedFilters.dateTo)}</span></div>{error && <div className="error-strip"><XCircle size={17} /><span>{error}</span></div>}<div className="table-wrap report-table-wrap">{rows.length ? renderTable() : (!loading && <EmptyState title="Tidak ada data laporan" description="Coba ubah periode atau filter laporan." />)}</div>{totalPages > 1 && <div className="pagination-bar"><button className="button button-secondary" type="button" disabled={appliedFilters.page <= 1} onClick={() => changePage(appliedFilters.page - 1)}>Sebelumnya</button><span>Halaman {appliedFilters.page} dari {totalPages}</span><button className="button button-secondary" type="button" disabled={appliedFilters.page >= totalPages} onClick={() => changePage(appliedFilters.page + 1)}>Berikutnya</button></div>}</section></div></>;
+  return <>
+    <PageHeader
+      eyebrow="Laporan"
+      title={config.title}
+      description={config.description}
+      action={<div className="page-actions report-export-actions">
+        <button className="button export-button export-excel" type="button" onClick={() => exportReport(reportKey, appliedFilters, 'xlsx')} disabled={!apiConnected || !hasFetched || loading}><FileSpreadsheet size={16} />Export Excel</button>
+        <button className="button export-button export-pdf" type="button" onClick={() => exportReport(reportKey, appliedFilters, 'pdf')} disabled={!apiConnected || !hasFetched || loading}><FileText size={16} />Export PDF</button>
+      </div>}
+    />
+    <div className="report-page-shell">
+      {sourceSummary && <div className="report-summary"><div><span>Uang masuk sumber</span><strong>{formatRupiah(sourceSummary.totalMonitoringIn)}</strong><small>Monitoring tt_cash_daily</small></div><div><span>Uang keluar sumber</span><strong>{formatRupiah(sourceSummary.totalMonitoringOut)}</strong><small>{sourceSummary.totalEvents || 0} event sumber</small></div><div><span>Net confirmed</span><strong>{formatRupiah(sourceSummary.netConfirmed)}</strong><small>{sourceSummary.matchedExcluded || 0} data matched dikecualikan</small></div></div>}
+      {financialSummary && <div className="report-summary financial-summary"><div><span>Saldo awal periode</span><strong>{formatRupiah(financialSummary.saldoAwal)}</strong><small>{appliedFilters.dateFrom}</small></div><div><span>Total debet</span><strong>{formatRupiah(financialSummary.totalDebit)}</strong><small>Transaksi tercatat, tidak termasuk saldo awal</small></div><div><span>Total kredit</span><strong>{formatRupiah(financialSummary.totalKredit)}</strong><small>Transaksi tercatat, tidak termasuk saldo awal</small></div><div><span>Saldo akhir periode</span><strong>{formatRupiah(financialSummary.saldoAkhir)}</strong><small>{appliedFilters.dateTo}</small></div></div>}
+      {financialSummary?.unclassifiedCount > 0 && <div className="info-strip report-warning"><XCircle size={17} /><span>{financialSummary.unclassifiedCount} baris belum terklasifikasi. Nilainya tetap dihitung dalam saldo dan ditampilkan sebagai Koreksi (+/-).</span></div>}
+      {balanceSummary && <div className="report-summary"><div><span>Saldo akhir</span><strong>{formatRupiah(balanceSummary.saldoAkhir)}</strong><small>{balanceSummary.totalAccounts || 0} akun</small></div><div><span>Akun selisih</span><strong>{balanceSummary.selisih || 0}</strong><small>Saldo tersimpan vs jurnal</small></div><div><span>Periode</span><strong>{appliedFilters.dateFrom}</strong><small>s.d. {appliedFilters.dateTo}</small></div></div>}
+      <section className="panel report-workspace">
+        <div className="report-filter-panel report-filter-panel-inline">
+          <div className="report-filter-heading">
+            <div><span className="section-kicker">Filter laporan</span><strong>{config.description}</strong></div>
+            <span className="count-label">{loading ? 'Memuat...' : hasFetched ? `${total} data` : 'Belum dimuat'}</span>
+          </div>
+          <div className="report-filter-grid">
+            {config.filters.flatMap(renderFilter)}
+            <button className="filter-clear" type="button" onClick={reset}><X size={14} />Bersihkan filter</button>
+            <button className="button button-primary report-fetch-button" type="button" onClick={() => fetchReport(filters)} disabled={loading} aria-busy={loading}>
+              {loading ? <><Spinner />Memuat data...</> : <><Search size={15} />Cari Data</>}
+            </button>
+          </div>
+        </div>
+        <div className="table-heading report-table-heading">
+          <div><span className="section-kicker">{displayedReportTitle}</span><h2>{loading ? 'Memuat laporan...' : hasFetched ? `${total} data` : 'Laporan belum dimuat'}</h2></div>
+          <span className="count-label">{hasFetched ? `${payload?.filters?.dateFrom || appliedFilters.dateFrom} s.d. ${payload?.filters?.dateTo || appliedFilters.dateTo}` : 'Klik Cari Data untuk memuat laporan'}</span>
+        </div>
+        {error && <div className="error-strip"><XCircle size={17} /><span>{error}</span></div>}
+        <div className="table-wrap report-table-wrap">
+          {loading
+            ? <div className="report-loading-state" role="status" aria-live="polite" aria-busy="true"><span className="report-loading-spinner" aria-hidden="true" /><strong>Memuat laporan...</strong><span>Data sedang diambil dan dihitung. Mohon tunggu.</span></div>
+            : !hasFetched
+              ? <div className="report-loading-state report-idle-state"><Search size={25} aria-hidden="true" /><strong>Belum ada data yang dimuat</strong><span>Atur filter laporan, lalu klik Cari Data.</span></div>
+              : rows.length ? renderTable() : <EmptyState title="Tidak ada data laporan" description="Coba ubah periode atau filter laporan." />}
+        </div>
+        {hasFetched && totalPages > 1 && <div className="pagination-bar"><button className="button button-secondary" type="button" disabled={appliedFilters.page <= 1 || loading} onClick={() => changePage(appliedFilters.page - 1)}>Sebelumnya</button><span>Halaman {appliedFilters.page} dari {totalPages}</span><button className="button button-secondary" type="button" disabled={appliedFilters.page >= totalPages || loading} onClick={() => changePage(appliedFilters.page + 1)}>Berikutnya</button></div>}
+      </section>
+    </div>
+  </>;
   /*
   return <><PageHeader eyebrow="Laporan" title={config.title} description={config.description} action={<div className="page-actions"><button className="button button-secondary" type="button" onClick={() => exportReport(reportKey, filters, 'xlsx')} disabled={!apiConnected}><FileBarChart2 size={16} />Export Excel</button><button className="button button-secondary" type="button" onClick={() => exportReport(reportKey, filters, 'pdf')} disabled={!apiConnected}>PDF</button></div>} /><div className="report-page-shell">{reportKey === 'financial' && <div className="report-tabs" role="tablist" aria-label="Laporan Kas dan Bank"><button className={filters.view === 'summary' ? 'report-tab active' : 'report-tab'} type="button" role="tab" aria-selected={filters.view === 'summary'} onClick={() => update('view', 'summary')}>REKAP</button><button className={filters.view === 'detail' ? 'report-tab active' : 'report-tab'} type="button" role="tab" aria-selected={filters.view === 'detail'} onClick={() => update('view', 'detail')}>DETAIL</button></div>}{sourceSummary && <div className="report-summary"><div><span>Uang masuk sumber</span><strong>{formatRupiah(sourceSummary.totalMonitoringIn)}</strong><small>Monitoring tt_cash_daily</small></div><div><span>Uang keluar sumber</span><strong>{formatRupiah(sourceSummary.totalMonitoringOut)}</strong><small>{sourceSummary.totalEvents || 0} event sumber</small></div><div><span>Net confirmed</span><strong>{formatRupiah(sourceSummary.netConfirmed)}</strong><small>{sourceSummary.matchedExcluded || 0} data matched dikecualikan</small></div></div>}{financialSummary && <div className="report-summary financial-summary"><div><span>Saldo awal periode</span><strong>{formatRupiah(financialSummary.saldoAwal)}</strong><small>{filters.dateFrom}</small></div><div><span>Total debet</span><strong>{formatRupiah(financialSummary.totalDebit)}</strong><small>Seluruh transaksi POSTED</small></div><div><span>Total kredit</span><strong>{formatRupiah(financialSummary.totalKredit)}</strong><small>Seluruh transaksi POSTED</small></div><div><span>Saldo akhir periode</span><strong>{formatRupiah(financialSummary.saldoAkhir)}</strong><small>{filters.dateTo}</small></div></div>}{financialSummary?.unclassifiedCount > 0 && <div className="info-strip report-warning"><XCircle size={17} /><span>{financialSummary.unclassifiedCount} baris belum terklasifikasi. Nilainya tetap dihitung dalam saldo dan ditampilkan sebagai Koreksi (+/-).</span></div>}{balanceSummary && <div className="report-summary"><div><span>Saldo akhir</span><strong>{formatRupiah(balanceSummary.saldoAkhir)}</strong><small>{balanceSummary.totalAccounts || 0} akun</small></div><div><span>Akun selisih</span><strong>{balanceSummary.selisih || 0}</strong><small>Saldo tersimpan vs jurnal</small></div><div><span>Periode</span><strong>{filters.dateFrom}</strong><small>s.d. {filters.dateTo}</small></div></div>}<section className="panel report-workspace"><div className="report-filter-panel report-filter-panel-inline"><div className="report-filter-heading"><div><span className="section-kicker">Filter laporan</span><strong>{config.description}</strong></div><span className="count-label">{loading ? 'Memuat...' : String(total) + ' data'}</span></div><div className="report-filter-grid">{config.filters.flatMap(renderFilter)}<button className="filter-clear" type="button" onClick={reset}><X size={14} />Bersihkan filter</button></div></div><div className="table-heading report-table-heading"><div><span className="section-kicker">{filters.view === 'summary' && reportKey === 'financial' ? 'Rekap' : filters.view === 'detail' && reportKey === 'financial' ? 'Detail' : config.title}</span><h2>{loading ? 'Memuat laporan...' : String(total) + ' data'}</h2></div><span className="count-label">{(payload?.filters?.dateFrom || filters.dateFrom) + ' s.d. ' + (payload?.filters?.dateTo || filters.dateTo)}</span></div>{error && <div className="error-strip"><XCircle size={17} /><span>{error}</span></div>}<div className="table-wrap report-table-wrap">{rows.length ? renderTable() : (!loading && <EmptyState title="Tidak ada data laporan" description="Coba ubah periode atau filter laporan." />)}</div>{totalPages > 1 && <div className="pagination-bar"><button className="button button-secondary" type="button" disabled={filters.page <= 1} onClick={() => update('page', filters.page - 1)}>Sebelumnya</button><span>Halaman {filters.page} dari {totalPages}</span><button className="button button-secondary" type="button" disabled={filters.page >= totalPages} onClick={() => update('page', filters.page + 1)}>Berikutnya</button></div>}</section></div></>;
 }
