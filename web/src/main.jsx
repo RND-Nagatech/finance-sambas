@@ -1523,7 +1523,9 @@ function reportDateDefaults(systemDate) {
 
 function dashboardDateDefaults(systemDate) {
   const today = businessDate(systemDate);
-  return { dateFrom: `${today.slice(0, 4)}-01-01`, dateTo: `${today.slice(0, 4)}-12-31`, kodeToko: '', bentukSaldo: '' };
+  const monthStart = `${today.slice(0, 7)}-01`;
+  const monthEnd = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)), 0)).toISOString().slice(0, 10);
+  return { dateFrom: monthStart, dateTo: monthEnd, kodeToko: '', bentukSaldo: '' };
 }
 
 function Dashboard({ state, systemDate, pendingTransactions, pendingManualTransactions = [], setView, setDetail, apiConnected, loadReport }) {
@@ -1574,11 +1576,9 @@ function Dashboard({ state, systemDate, pendingTransactions, pendingManualTransa
   const operations = data.operations || fallback.operations;
   const flowData = report?.flow || buildDailyCashFlow(transactions);
   const categoriesByUnit = report?.categoriesByUnit || {};
-  const categoryDataFor = (unit) => {
-    if (Array.isArray(categoriesByUnit[unit])) return categoriesByUnit[unit];
-    if (unit === 'NAGAGOLD' && Array.isArray(report?.categories)) return report.categories;
-    return buildCategoryBreakdown(unit, transactions, accounts);
-  };
+  const categoryDataFor = (unit) => report
+    ? (Array.isArray(categoriesByUnit[unit]) ? categoriesByUnit[unit] : [])
+    : buildCategoryBreakdown(unit, transactions, accounts);
   const nagagoldCategoryData = categoryDataFor('NAGAGOLD');
   const optikCategoryData = categoryDataFor('OPTIK');
   const showOptikCategory = optikCategoryData.length > 0;
@@ -1599,8 +1599,8 @@ function Dashboard({ state, systemDate, pendingTransactions, pendingManualTransa
   const updateFilter = (key, value) => setFilters((current) => ({ ...current, [key]: value }));
   const pendingForActivity = [...pendingTransactions, ...pendingManualTransactions];
   return <>
-    <PageHeader eyebrow="Ringkasan Finance" title="Dashboard Finance" description="Posisi saldo confirmed dan aktivitas Finance–Nagagold pada periode yang dipilih." action={<div className="page-actions"><button className="button button-secondary" type="button" onClick={() => setFilters(dashboardDateDefaults(systemDate))}><RefreshCw size={16} />Tahun ini</button></div>} />
-    <section className="report-filter-panel"><div className="report-filter-heading"><div><span className="section-kicker">Filter laporan</span><strong>Periode, cabang, dan bentuk penyimpanan</strong></div>{loading && <span className="loading-label">Memuat data...</span>}</div><div className="report-filter-grid"><label className="filter-field"><span>Dari tanggal</span><input type="date" value={filters.dateFrom} onChange={(event) => updateFilter('dateFrom', event.target.value)} /></label><label className="filter-field"><span>Sampai tanggal</span><input type="date" value={filters.dateTo} onChange={(event) => updateFilter('dateTo', event.target.value)} /></label><label className="filter-field"><span>Cabang</span><SearchableSelect value={filters.kodeToko} onChange={(value) => updateFilter('kodeToko', value)} options={[{ value: '', label: 'Semua cabang Nagagold' }, ...(state.branches || []).map((branch) => ({ value: branch.kodeToko, label: `${branch.kodeToko} · ${branch.namaToko}` }))]} placeholder="Semua cabang Nagagold" /></label><label className="filter-field"><span>Bentuk penyimpanan</span><select value={filters.bentukSaldo} onChange={(event) => updateFilter('bentukSaldo', event.target.value)}><option value="">Semua</option><option value="KAS_TUNAI">Tunai</option><option value="REKENING_BANK">Non Tunai</option></select></label></div></section>
+    <PageHeader eyebrow="Ringkasan Finance" title="Dashboard Finance" description="Posisi saldo confirmed dan aktivitas Finance–Nagagold pada periode yang dipilih." action={<div className="page-actions"><button className="button button-secondary" type="button" onClick={() => setFilters(dashboardDateDefaults(systemDate))}><RefreshCw size={16} />Bulan ini</button></div>} />
+    <section className="report-filter-panel"><div className="report-filter-heading"><div><span className="section-kicker">Filter laporan</span></div>{loading && <span className="loading-label">Memuat data...</span>}</div><div className="report-filter-grid"><label className="filter-field"><span>Dari tanggal</span><input type="date" value={filters.dateFrom} onChange={(event) => updateFilter('dateFrom', event.target.value)} /></label><label className="filter-field"><span>Sampai tanggal</span><input type="date" value={filters.dateTo} onChange={(event) => updateFilter('dateTo', event.target.value)} /></label><label className="filter-field"><span>Cabang</span><SearchableSelect value={filters.kodeToko} onChange={(value) => updateFilter('kodeToko', value)} options={[{ value: '', label: 'Semua cabang' }, ...(state.branches || []).map((branch) => { const business = String(branch.jenisBisnis || branch.jenis_bisnis || 'NAGAGOLD').trim().toUpperCase(); const code = String(branch.kodeToko || '').trim().toUpperCase(); return { value: `${business}::${code}`, label: `${business} · ${code} · ${branch.namaToko}` }; })]} placeholder="Semua cabang" /></label><label className="filter-field"><span>Bentuk penyimpanan</span><select value={filters.bentukSaldo} onChange={(event) => updateFilter('bentukSaldo', event.target.value)}><option value="">Semua</option><option value="KAS_TUNAI">Tunai</option><option value="REKENING_BANK">Non Tunai</option></select></label></div></section>
     {error && <div className="error-strip"><XCircle size={17} /><span>{error}</span></div>}
     <div className="dashboard-summary-grid dashboard-summary-grid-five">{summaryCards.map((card) => <StatCard key={card.key} icon={card.icon} label={card.label} value={formatRupiah(card.value)} note={card.note} accent={card.accent} />)}</div>
     <div className="report-mini-grid"><div><span>Penerimaan confirmed</span><strong>{formatRupiah(period.totalPenerimaan)}</strong></div><div><span>Pengeluaran confirmed</span><strong>{formatRupiah(period.totalPengeluaran)}</strong></div><div><span>Mutasi antar kas</span><strong>{formatRupiah(period.totalMutasiAntarKas)}</strong></div><div><span>{storageLabel ? `Akun ${storageLabel}` : 'Akun terdaftar'}</span><strong>{report ? balanceRows.length : scopedAccounts.length}</strong><small>{storageLabel ? `Akun ${storageLabel.toLowerCase()} yang dipilih` : 'Seluruh akun aktif'}</small></div></div>

@@ -91,6 +91,7 @@ export function transactionMongoQuery(filters, { nagagoldOnly = false, mutationO
   const query = { ...dateQuery('transactionDate', filters.dateFrom, filters.dateTo) };
   if (nagagoldOnly) { query.sumber = { $in: ['NAGAGOLD', 'OPTIK'] }; }
   if (filters.kodeToko) query.kodeToko = filters.kodeToko;
+  if (filters.unit && ['NAGAGOLD', 'OPTIK'].includes(filters.unit)) query.jenis_bisnis = filters.unit;
   if (filters.sourceType) query.source_type = filters.sourceType === 'SYNC' ? { $in: SYNC_SOURCE_TYPES } : filters.sourceType;
   if (filters.jenisTransaksi) query.jenisTransaksi = filters.jenisTransaksi;
   if (filters.bentukTransaksi) query.bentukTransaksi = filters.bentukTransaksi;
@@ -284,7 +285,12 @@ export async function reportBalances(input = {}) {
   // adalah data master yang dapat bertambah, jadi jangan membatasi laporan pada
   // daftar unit yang di-hardcode.
   const accountQuery = {};
-  if (filters.kodeToko) accountQuery.kode_toko = filters.kodeToko;
+  // Rekening Finance tidak dimiliki satu cabang tertentu. Satu rekening
+  // dapat dipakai beberapa cabang dalam jenis bisnis yang sama, sehingga
+  // filter cabang hanya diterapkan pada transaksi/jurnal, bukan master
+  // rekening. Jika diterapkan ke sini, rekening yang tidak memiliki
+  // `kode_toko` akan hilang seluruhnya dari ringkasan dashboard.
+  if (filters.unit) accountQuery.unit = filters.unit;
   if (filters.accountId) accountQuery._id = filters.accountId;
   if (filters.bentukSaldo === 'KAS_TUNAI') {
     accountQuery.$or = [
@@ -456,13 +462,114 @@ function dashboardPeriodRows(filters, transactions) {
   };
 }
 
+function dashboardTransactionCategories(transactions) {
+  const categories = new Map();
+  const categoriesByUnit = new Map();
+  for (const transaction of transactions) {
+    if (transaction.bentukTransaksi === 'TRANSFER_INTERNAL') continue;
+    const amount = Number(transaction.amount || 0);
+    if (!amount) continue;
+    const category = dashboardCategoryLabel(transaction);
+    categories.set(category, (categories.get(category) || 0) + amount);
+    const unit = dashboardTransactionUnit(transaction);
+    const unitCategories = categoriesByUnit.get(unit) || new Map();
+    unitCategories.set(category, (unitCategories.get(category) || 0) + amount);
+    categoriesByUnit.set(unit, unitCategories);
+  }
+  const colors = ['#087c75', '#d4932f', '#2f7fb8', '#8a6bbd', '#d46a5c'];
+  const formatCategories = (categoryMap) => [...categoryMap.entries()]
+    .sort(([, left], [, right]) => right - left)
+    .map(([label, value], index) => ({ label, value, color: colors[index % colors.length] }));
+  return {
+    categories: formatCategories(categories),
+    categoriesByUnit: Object.fromEntries([...categoriesByUnit.entries()].map(([unit, categoryMap]) => [unit, formatCategories(categoryMap)])),
+  };
+}
+
+function dashboardFlowCategory(tipe) {
+  const value = String(tipe || '').toUpperCase();
+  if (value === 'PENJUALAN') return 'Penjualan';
+  if (value === 'PEMBELIAN') return 'Pembelian / Buyback';
+  if (value === 'OPERASIONAL' || value === 'PENYESUAIAN_SALDO') return 'Operasional';
+  return value.replaceAll('_', ' ').toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase()) || 'Lainnya';
+}
+
+async function dashboardJournalFlow(filters, accountIds = []) {
+  const year = String(filters.dateFrom || filters.dateTo || '').slice(0, 4);
+  const flowFrom = /^\d{4}$/.test(year) ? `${year}-01-01` : filters.dateFrom;
+  const flowTo = /^\d{4}$/.test(year) ? `${year}-12-31` : filters.dateTo;
+  const match = {
+    status: 'POSTED',
+    tanggal: { $gte: flowFrom, $lte: flowTo },
+    tipe: { $nin: ['SALDO_AWAL', 'PENYESUAIAN_SALDO', 'MUTASI', 'PEMBALIKAN'] },
+  };
+  if (filters.kodeToko) match.kode_toko = filters.kodeToko;
+  if (filters.unit && ['NAGAGOLD', 'OPTIK'].includes(filters.unit)) match.jenis_bisnis = filters.unit;
+  if (accountIds.length) match.rekening_id = { $in: accountIds };
+  const grouped = await JournalEntry.aggregate([
+    { $match: match },
+    { $group: {
+      _id: {
+        bulan: { $substrBytes: ['$tanggal', 0, 7] },
+        tipe: '$tipe',
+        unit: { $cond: [{ $ne: ['$jenis_bisnis', ''] }, '$jenis_bisnis', '$sumber'] },
+      },
+      masuk: { $sum: '$debet' },
+      keluar: { $sum: '$kredit' },
+    } },
+  ]);
+  const labels = [];
+  const cursor = new Date(`${flowFrom}T00:00:00Z`);
+  const last = new Date(`${flowTo}T00:00:00Z`);
+  cursor.setUTCDate(1);
+  last.setUTCDate(1);
+  while (cursor <= last) {
+    labels.push(cursor.toISOString().slice(0, 7));
+    cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+  }
+  const rows = new Map(labels.map((label) => [label, { date: label, masuk: 0, keluar: 0 }]));
+  const categories = new Map();
+  const categoriesByUnit = new Map();
+  for (const item of grouped) {
+    const row = rows.get(item._id.bulan);
+    if (!row) continue;
+    const masuk = Number(item.masuk || 0);
+    const keluar = Number(item.keluar || 0);
+    row.masuk += masuk;
+    row.keluar += keluar;
+    const amount = masuk + keluar;
+    const category = dashboardFlowCategory(item._id.tipe);
+    categories.set(category, (categories.get(category) || 0) + amount);
+    const unit = String(item._id.unit || 'FINANCE').toUpperCase();
+    const unitCategories = categoriesByUnit.get(unit) || new Map();
+    unitCategories.set(category, (unitCategories.get(category) || 0) + amount);
+    categoriesByUnit.set(unit, unitCategories);
+  }
+  const colors = ['#087c75', '#d4932f', '#2f7fb8', '#8a6bbd', '#d46a5c'];
+  const formatCategories = (categoryMap) => [...categoryMap.entries()]
+    .sort(([, left], [, right]) => right - left)
+    .map(([label, value], index) => ({ label, value, color: colors[index % colors.length] }));
+  return {
+    rows: [...rows.values()],
+    granularity: 'BULANAN',
+    categories: formatCategories(categories),
+    categoriesByUnit: Object.fromEntries([...categoriesByUnit.entries()].map(([unit, categoryMap]) => [unit, formatCategories(categoryMap)])),
+  };
+}
+
 export async function reportDashboard(input = {}) {
   const filters = normalizeReportFilters(input);
+  const branchRequestScope = {
+    ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}),
+    ...(filters.unit && ['NAGAGOLD', 'OPTIK'].includes(filters.unit)
+      ? { sourceSystem: filters.unit.toLowerCase() }
+      : {}),
+  };
   const [balances, confirmedTransactions, pendingRequests, approvedRequests, pendingManual, needsReview, mappingFailed, conflicts, sync] = await Promise.all([
     reportBalances(filters),
     transactionDocuments(confirmedQuery(filters)),
-    TransferRequest.countDocuments({ status: 'PENDING_APPROVAL', ...dateQuery('requestedAt', `${filters.dateFrom}T00:00:00.000+07:00`, `${filters.dateTo}T23:59:59.999+07:00`), ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }),
-    TransferRequest.countDocuments({ approval_status: 'APPROVED', payment_status: { $ne: 'SUDAH_DIBAYAR' }, ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }),
+    TransferRequest.countDocuments({ status: 'PENDING_APPROVAL', ...dateQuery('requestedAt', `${filters.dateFrom}T00:00:00.000+07:00`, `${filters.dateTo}T23:59:59.999+07:00`), ...branchRequestScope }),
+    TransferRequest.countDocuments({ approval_status: 'APPROVED', payment_status: { $ne: 'SUDAH_DIBAYAR' }, ...branchRequestScope }),
     transactionCount({ ...transactionMongoQuery(filters), source_type: 'MANUAL_ADMIN', approval_status: 'PENDING' }, { mutationOnly: true }),
     // Transaksi yang sudah tercatat/terhubung tidak lagi menjadi pekerjaan
     // review, meskipun metadata klasifikasi lama masih menyimpan
@@ -470,7 +577,7 @@ export async function reportDashboard(input = {}) {
     transactionCount({ ...transactionMongoQuery(filters), isImported: true, classification_status: { $in: ['REVIEW_REQUIRED', 'BLOCKED'] }, status: { $nin: ['TERCATAT', 'TERHUBUNG', 'GAGAL'] } }, { nagagoldOnly: true }),
     transactionCount({ ...transactionMongoQuery(filters), isImported: true, mappingStatus: { $in: ['PERLU_PEMETAAN', 'PEMETAAN_AMBIGU', 'GAGAL_MAPPING'] } }, { nagagoldOnly: true }),
     transactionCount({ ...transactionMongoQuery(filters), reconciliation_status: 'CONFLICT' }),
-    SyncState.find({ sourceSystem: { $in: ['nagagold', 'optik'] }, ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) }).sort({ lastSuccessAt: -1 }).limit(20).lean(),
+    SyncState.find({ sourceSystem: { $in: ['nagagold', 'optik'] }, ...branchRequestScope }).sort({ lastSuccessAt: -1 }).limit(20).lean(),
   ]);
   const accounts = balances.rows;
   const selectedAccountIds = new Set(accounts.map((row) => String(row.rekeningId || '')));
@@ -487,7 +594,8 @@ export async function reportDashboard(input = {}) {
   const periodReceipts = filteredConfirmedTransactions.filter((item) => item.bentukTransaksi === 'MUTASI_REKENING' && item.arahDana === 'MASUK').reduce((sum, item) => sum + Number(item.amount || 0), 0);
   const periodPayments = filteredConfirmedTransactions.filter((item) => item.bentukTransaksi === 'MUTASI_REKENING' && item.arahDana === 'KELUAR').reduce((sum, item) => sum + Number(item.amount || 0), 0);
   const internalMutations = filteredConfirmedTransactions.filter((item) => item.bentukTransaksi === 'TRANSFER_INTERNAL').reduce((sum, item) => sum + Number(item.amount || 0), 0);
-  const dashboardFlow = dashboardPeriodRows(filters, filteredConfirmedTransactions);
+  const dashboardFlow = await dashboardJournalFlow(filters, [...selectedAccountIds]);
+  const dashboardCategories = dashboardTransactionCategories(filteredConfirmedTransactions);
   const businessTypes = await BusinessType.find({ aktif: true }).sort({ nama_bisnis: 1, kode_bisnis: 1 }).lean();
   const configuredBusinesses = businessTypes.map((item) => ({ code: String(item.kode_bisnis || '').toUpperCase(), name: item.nama_bisnis || item.kode_bisnis || '' }));
   const configuredCodes = new Set(configuredBusinesses.map((item) => item.code));
@@ -523,8 +631,8 @@ export async function reportDashboard(input = {}) {
     period: { totalPenerimaan: periodReceipts, totalPengeluaran: periodPayments, totalMutasiAntarKas: internalMutations, confirmedTransactions: filteredConfirmedTransactions.length },
     flow: dashboardFlow.rows,
     flowGranularity: dashboardFlow.granularity,
-    categories: dashboardFlow.categories,
-    categoriesByUnit: dashboardFlow.categoriesByUnit,
+    categories: dashboardCategories.categories,
+    categoriesByUnit: dashboardCategories.categoriesByUnit,
     operations: { pendingRequests, approvedUnpaidRequests: approvedRequests, pendingManual, needsReview, mappingFailed, reconciliationConflicts: conflicts, sync: sync.map((item) => ({ kodeToko: item.kodeToko, lastSuccessAt: item.lastSuccessAt || null, lastError: item.lastError || '', lastFetchedCount: item.lastFetchedCount || 0 })) },
   };
 }
@@ -532,6 +640,7 @@ export async function reportDashboard(input = {}) {
 export async function reportRequests(input = {}) {
   const filters = normalizeReportFilters(input);
   const query = { ...dateQuery('requestedAt', `${filters.dateFrom}T00:00:00.000+07:00`, `${filters.dateTo}T23:59:59.999+07:00`), ...(filters.kodeToko ? { kodeToko: filters.kodeToko } : {}) };
+  if (filters.unit && ['NAGAGOLD', 'OPTIK'].includes(filters.unit)) query.sourceSystem = filters.unit.toLowerCase();
   if (input.status) query.status = String(input.status).toUpperCase();
   if (input.paymentStatus) query.payment_status = String(input.paymentStatus).toUpperCase();
   if (input.approvalStatus) query.approval_status = String(input.approvalStatus).toUpperCase();
