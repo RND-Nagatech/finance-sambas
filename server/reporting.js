@@ -1203,6 +1203,11 @@ export async function reportFinancial(input = {}) {
     stats.saldoAwal = Number(snapshot?.saldo_akhir || 0);
     for (const row of before) stats.saldoAwal += row.effect;
     for (const row of period) addFinancialEntry(stats, row);
+    // Jika rekening hanya membawa saldo dari snapshot dan tidak memiliki
+    // transaksi pada periode aktif, tidak ada pemanggilan addFinancialEntry
+    // yang mengisi ulang saldo akhir. Hitung ulang di sini agar baris rekening
+    // dan rekap kelompok konsisten.
+    stats.saldoAkhir = stats.saldoAwal + stats.debet - stats.kredit;
     const publicStats = publicFinancialStats(stats);
     const saldoSebelumPeriode = Number(snapshot?.saldo_akhir || 0) + before.reduce((sum, row) => sum + row.effect, 0);
     return {
@@ -1225,6 +1230,16 @@ export async function reportFinancial(input = {}) {
       hasPeriodTransactions: period.length > 0,
     };
   }).filter((row) => {
+    // Rekap kelompok/unit/cabang harus tetap memasukkan rekening yang membawa
+    // saldo dari periode sebelumnya. Rekening seperti ini bisa saja tidak
+    // punya transaksi pada periode aktif, tetapi saldonya tetap membentuk
+    // saldo awal dan saldo akhir kelompok. Untuk tampilan per rekening,
+    // perilaku lama dipertahankan: rekening tanpa transaksi hanya muncul jika
+    // pengguna mengaktifkan checkbox-nya.
+    const rekapNeedsOpeningBalance = filters.view === 'summary'
+      && filters.groupBy !== 'ACCOUNT'
+      && Number(row.saldoSebelumPeriode || 0) !== 0;
+    if (rekapNeedsOpeningBalance) return true;
     if (filters.includeEmptyAccounts && !filters.kodeToko) return true;
     return row.hasPeriodTransactions || (Boolean(filters.kodeToko) && row.hasTransactions);
   });
@@ -1277,64 +1292,243 @@ export async function reportFinancial(input = {}) {
   };
 }
 
+function exportValue(value, fallback = '-') {
+  return value === undefined || value === null || value === '' ? fallback : value;
+}
+
+function exportStack(primary, secondary = '') {
+  const first = exportValue(primary);
+  const second = secondary === undefined || secondary === null || secondary === '' ? '' : String(secondary);
+  return second && second !== String(first) ? `${first}\n${second}` : first;
+}
+
+function exportDate(value, withTime = false) {
+  if (!value) return '-';
+  const raw = String(value);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(raw)
+    ? new Date(`${raw}T00:00:00+07:00`)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return raw;
+  return new Intl.DateTimeFormat('id-ID', {
+    timeZone: REPORT_TIMEZONE,
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    ...(withTime ? { hour: '2-digit', minute: '2-digit' } : {}),
+  }).format(date);
+}
+
+function exportType(value) {
+  return exportValue(value).toString().replaceAll('_', ' ');
+}
+
+function exportHumanStatus(value) {
+  return exportType(value).toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function exportStatus(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  const labels = {
+    PENDING_APPROVAL: 'PENDING',
+    WAITING_PAYMENT_APPROVAL: 'PENDING',
+    PENDING: 'PENDING',
+    APPROVED: 'APPROVED',
+    REJECTED: 'REJECTED',
+    POSTED: 'Tercatat',
+    PROVISIONAL: 'Sementara',
+    REVERSED: 'Dibalik',
+    BELUM_DIBUAT: 'Belum dibuat',
+    REQUESTED: 'Menunggu Diterima Admin',
+    IN_PROGRESS: 'Sedang Diproses',
+    NOT_STARTED: 'Belum diproses',
+    WAITING_TRANSFER: 'Menunggu transfer',
+    PAYMENT_REJECTED: 'Realisasi Ditolak',
+    PAID: 'Sudah dibayar',
+    COMPLETED: 'Selesai',
+    CANCELLED: 'Dibatalkan',
+    ERROR: 'Perlu diperiksa',
+    PERLU_REVIEW: 'Perlu diperiksa',
+    PERLU_DIPERIKSA: 'Perlu diperiksa',
+    NOT_APPLICABLE: 'Tidak berlaku',
+    TIDAK_BERLAKU: 'Tidak berlaku',
+    NOT_REQUIRED: 'Tidak perlu',
+    TIDAK_DIPERLUKAN: 'Tidak perlu',
+    TERCATAT: 'Tercatat',
+    TERHUBUNG: 'Terhubung',
+  };
+  return exportValue(labels[normalized] || (normalized ? exportHumanStatus(normalized) : ''));
+}
+
+function exportSourceLabel(source) {
+  const labels = {
+    FINANCE: 'Input Admin',
+    MANUAL_ADMIN: 'Input Admin',
+    NAGAGOLD: 'Sync Nagagold',
+    SYNC_NAGAGOLD: 'Sync Nagagold',
+    OPTIK: 'Sync Optik',
+    SYNC_OPTIK: 'Sync Optik',
+    SYNC: 'Sinkronisasi',
+    BRANCH_REQUEST: 'Permintaan Dana',
+  };
+  const normalized = String(source || '').trim().toUpperCase();
+  return exportValue(labels[normalized] || source);
+}
+
+function financialSummaryRowsForExport(payload) {
+  if (payload.groupBy === 'CASH_GROUP') {
+    const rows = [];
+    const visit = (nodes = []) => nodes.forEach((node) => {
+      if (node.rowType === 'GROUP') rows.push(node);
+      visit(node.children);
+    });
+    visit(payload.groupTree || []);
+    return rows;
+  }
+  return payload.summaryRows || payload.rows || [];
+}
+
 export function reportRowsForExport(report, payload) {
   if (report === 'financial') {
-    const rows = payload.view === 'summary' ? (payload.summaryRows || []) : (payload.rows || []);
-    if (payload.view === 'summary') return rows.map((row) => ({
-      'Jenis baris': row.rowType === 'GROUP' ? 'Kelompok kas' : 'Rekening',
-      'Kelompok kas': row.rowType === 'GROUP' ? row.label : (row.cashGroupName || '-'),
-      'Unit bisnis': row.unit || '-',
-      'Toko / cabang': row.kodeToko || '-',
-      'Rekening / kas': row.rowType === 'GROUP' ? row.label : row.accountLabel,
+    if (payload.view === 'summary') return financialSummaryRowsForExport(payload).map((row) => ({
+      'Kelompok / Rekening': row.rowType === 'GROUP'
+        ? exportStack(row.label, row.code || row.unit || '-')
+        : exportStack(row.accountName || row.label || row.accountLabel, row.accountLabel || '-'),
       'Saldo awal': Number(row.saldoAwal || 0),
       Debet: Number(row.debet ?? row.totalDebit ?? 0),
       Kredit: Number(row.kredit ?? row.totalKredit ?? 0),
       'Saldo akhir': Number(row.saldoAkhir || 0),
     }));
-    return rows.map((row) => ({
-      Tanggal: row.date,
-      'No. Keuangan': row.journalNumber,
-      'No. Transaksi': row.transactionNumber,
-      Rekening: row.accountLabel,
-      Sumber: row.source,
-      Jenis: row.category,
-      Keterangan: row.description,
+    return (payload.rows || []).map((row) => ({
+      Tanggal: exportDate(row.date),
+      'No. Keuangan': exportValue(row.journalNumber),
+      'No. Transaksi': exportValue(row.transactionNumber),
+      Sumber: exportSourceLabel(row.source),
+      Rekening: exportStack(row.accountName, row.accountNumber),
+      Jenis: exportValue(row.category),
+      Keterangan: exportValue(row.description),
       Debet: Number((row.reportDebit ?? row.debit) || 0),
       Kredit: Number((row.reportCredit ?? row.credit) || 0),
       'Saldo berjalan': Number(row.saldoBerjalan || 0),
     }));
   }
-  if (['nagagold-source', 'nagagold-cash', 'nagagold-accounts'].includes(report)) return (payload.rows || []).map((row) => ({
-    'Tanggal Sumber': row.sourceDate,
-    Sumber: row.sumber,
-    'ID Sumber': row.sourceTransactionId,
-    'No Reff': row.noReff,
-    Cabang: row.kodeToko,
-    'No Rekening': row.noRekening,
-    'Kode Bank': row.kodeBank,
-    'Nama Bank': row.namaBank,
-    Jenis: row.jenis,
-    Kategori: row.kategori,
-    'Metode Pembayaran': row.metodePembayaran,
-    Deskripsi: row.deskripsi,
-    Keterangan: row.keterangan,
-    'Uang Masuk': row.jumlahIn,
-    'Uang Keluar': row.jumlahOut,
-    'Status Sumber': row.statusSumber,
-    Finalitas: row.finalitas,
-    Mapping: row.mappingStatus,
-    Rekonsiliasi: row.rekonsiliasiStatus,
-    Approval: row.approvalStatus,
-    Jurnal: row.journalStatus,
-    'Nominal Confirmed Masuk': row.confirmedIn,
-    'Nominal Confirmed Keluar': row.confirmedOut,
+  if (report === 'nagagold-source') return (payload.rows || []).map((row) => ({
+    'Tanggal sumber': exportDate(row.sourceDate || row.transactionDate),
+    Sumber: exportValue(row.sumber),
+    Cabang: exportValue(row.kodeToko),
+    Referensi: exportValue(row.noReff || row.sourceTransactionId),
+    'Jenis / kategori': exportStack(row.kategori || row.jenis, row.jenis),
+    Metode: exportValue(row.metodePembayaran),
+    Masuk: Number(row.jumlahIn || 0),
+    Keluar: Number(row.jumlahOut || 0),
+    Finalitas: exportValue(row.finalitas, 'UNVERIFIED'),
+    Mapping: exportStatus(row.mappingStatus || 'PERLU_PEMETAAN'),
+    Rekonsiliasi: exportValue(row.rekonsiliasiStatus, 'UNMATCHED'),
   }));
-  if (report === 'balances') return (payload.rows || []).map((row) => ({ Unit: row.unit, Cabang: row.kodeToko, 'Kode Akun': row.kodeAkun, 'Nama Kas/Rekening': row.namaRekening, 'Jenis Akun': row.jenisAkun, 'Saldo Awal': row.saldoAwal, Debit: row.totalDebit, Kredit: row.totalKredit, 'Saldo Akhir': row.saldoAkhir, 'Saldo Tersimpan': row.saldoTersimpan, Selisih: row.selisihSaldoTersimpan }));
-  if (report === 'requests') return (payload.rows || []).map((row) => ({ 'Request ID': row.requestId, Cabang: row.kodeToko, 'Jenis Request': row.jenisRequest, Nominal: row.nilaiRp, Approval: row.approvalStatus, Pembayaran: row.paymentStatus, 'Tanggal Pengajuan': row.requestedAt, 'Tanggal Approval': row.approvedAt || '', 'Tanggal Transfer': row.transferDate || '', 'Referensi Transfer': row.transferReference || '' }));
-  if (report === 'journals') return (payload.rows || []).map((row) => ({ Nomor: row.no_keuangan, Tanggal: row.tanggal, Jenis: row.tipe, Status: row.status, Transaksi: row.transaction?.transactionNumber || row.no_transaksi, 'No. rekening': row.no_rekening, 'Nama rekening': row.nama_rekening, Nominal: Math.max(Number(row.debet || 0), Number(row.kredit || 0)), Debit: Number(row.debet || 0), Kredit: Number(row.kredit || 0) }));
-  if (report === 'reconciliation') return (payload.rows || []).map((row) => ({ Tanggal: row.transactionDate, Nomor: row.transactionNumber, Cabang: row.kodeToko, Referensi: row.sourceNoReff, Nominal: row.amount, Mapping: row.mappingStatus, 'Alasan Mapping': row.mappingReason, Rekonsiliasi: row.reconciliationStatus, 'Pasangan Transaksi': row.matchedTransactionId, Klasifikasi: row.classificationStatus, 'Alasan Klasifikasi': row.classificationReason, Jurnal: row.journalStatus }));
-  if (report === 'mutations') return (payload.rows || []).map((row) => ({ 'Jenis Kas Asal': row.jenisKasAsal, 'Jenis Kas Tujuan': row.jenisKasTujuan, 'Rekening Asal': row.rekeningAsal, 'Rekening Tujuan': row.rekeningTujuan, 'Jumlah Mutasi (Rp)': row.jumlahMutasi }));
-  return (payload.rows || []).map((row) => ({ Tanggal: row.transactionDate, 'Tanggal Posting': row.postedDate, Nomor: row.transactionNumber, Sumber: row.sourceType, Cabang: row.kodeToko, Jenis: row.jenisTransaksi, Referensi: row.sourceNoReff || row.requestId, 'Nominal Monitoring': row.amount, 'Nominal Confirmed': row.confirmedAmount, Arah: row.arahDana, Approval: row.approvalStatus, Jurnal: row.journalStatus, Sinkronisasi: row.syncStatus, Rekonsiliasi: row.reconciliationStatus }));
+  if (report === 'nagagold-cash') return (payload.rows || []).map((row) => ({
+    Tanggal: exportDate(row.sourceDate || row.transactionDate),
+    Sumber: exportValue(row.sumber),
+    Cabang: exportValue(row.kodeToko),
+    'No. referensi': exportValue(row.noReff || row.sourceTransactionId),
+    Jenis: exportValue(row.jenis),
+    Kategori: exportValue(row.kategori),
+    Keterangan: exportStack(row.keterangan || row.deskripsi, row.sourceInvoiceNumbers?.length ? row.sourceInvoiceNumbers.join(', ') : ''),
+    'Uang masuk': Number(row.jumlahIn || 0),
+    'Uang keluar': Number(row.jumlahOut || 0),
+    'Status sumber': exportValue(row.statusSumber),
+  }));
+  if (report === 'nagagold-accounts') return (payload.rows || []).map((row) => ({
+    Tanggal: exportDate(row.sourceDate || row.transactionDate),
+    Sumber: exportValue(row.sumber),
+    Cabang: exportValue(row.kodeToko),
+    Bank: exportValue(row.namaBank || row.kodeBank),
+    'No. rekening': exportValue(row.noRekening),
+    'No. referensi': exportValue(row.noReff || row.sourceTransactionId),
+    'Jenis / kategori': exportStack(row.kategori || row.jenis, row.jenis),
+    Keterangan: exportStack(row.keterangan || row.deskripsi, row.sourceInvoiceNumbers?.length ? row.sourceInvoiceNumbers.join(', ') : ''),
+    'Uang masuk': Number(row.jumlahIn || 0),
+    'Uang keluar': Number(row.jumlahOut || 0),
+    'Status sumber': exportValue(row.statusSumber),
+  }));
+  if (report === 'balances') return (payload.rows || []).map((row) => ({
+    'Kode akun': exportValue(row.kodeAkun),
+    'Kas / rekening': exportValue(row.namaRekening),
+    Unit: exportValue(row.unit),
+    Cabang: exportValue(row.kodeToko),
+    Jenis: exportType(row.jenisAkun),
+    'Saldo awal': Number(row.saldoAwal || 0),
+    Debit: Number(row.totalDebit || 0),
+    Kredit: Number(row.totalKredit || 0),
+    'Saldo akhir': Number(row.saldoAkhir || 0),
+    Selisih: exportStatus(row.rekonsiliasiSaldo),
+  }));
+  if (report === 'requests') return (payload.rows || []).map((row) => ({
+    'Request ID': exportStack(row.requestId, row.noRekening),
+    Cabang: exportValue(row.kodeToko),
+    Jenis: exportType(row.jenisRequest),
+    Nominal: Number(row.nilaiRp || 0),
+    Pengajuan: exportDate(row.requestedAt, true),
+    Approval: exportStatus(row.approvalStatus || row.status),
+    Pembayaran: exportStatus(row.paymentStatus || 'MENUNGGU_TRANSFER'),
+    Transfer: exportValue(row.transferReference),
+  }));
+  if (report === 'journals') return (payload.rows || []).map((row) => ({
+    'No. keuangan': exportValue(row.no_keuangan),
+    Tanggal: exportDate(row.tanggal),
+    Jenis: exportStatus(row.tipe),
+    Status: exportStatus(row.status),
+    Transaksi: exportValue(row.transaction?.transactionNumber || row.no_transaksi),
+    Rekening: exportStack(row.no_rekening, row.nama_rekening),
+    Debet: Number(row.debet || 0),
+    Kredit: Number(row.kredit || 0),
+  }));
+  if (report === 'reconciliation') return (payload.rows || []).map((row) => ({
+    Transaksi: exportStack(row.transactionNumber, row.sourceInvoiceNumbers?.length ? row.sourceInvoiceNumbers.join(', ') : ''),
+    Cabang: exportValue(row.kodeToko),
+    'Referensi sumber': exportValue(row.sourceNoReff),
+    Nominal: Number(row.amount || 0),
+    Mapping: exportStatus(row.mappingStatus || 'PERLU_PEMETAAN'),
+    Rekonsiliasi: exportStatus(row.reconciliationStatus || 'UNMATCHED'),
+    Klasifikasi: exportStatus(row.classificationStatus || 'BLOCKED'),
+    Jurnal: exportStatus(row.journalStatus || 'BELUM_DIBUAT'),
+  }));
+  if (report === 'mutations') return (payload.rows || []).map((row) => ({
+    'Jenis kas asal': exportType(row.jenisKasAsal),
+    'Jenis kas tujuan': exportType(row.jenisKasTujuan),
+    'Rekening asal': exportValue(row.rekeningAsal),
+    'Rekening tujuan': exportValue(row.rekeningTujuan),
+    'Jumlah mutasi (Rp)': Number(row.jumlahMutasi || 0),
+  }));
+  return (payload.rows || []).map((row) => ({
+    Tanggal: exportDate(row.transactionDate),
+    Transaksi: exportStack(row.transactionNumber, row.postedDate ? `Posting ${exportDate(row.postedDate)}` : 'Belum posting'),
+    Sumber: exportSourceLabel(row.sourceType),
+    Cabang: exportValue(row.kodeToko),
+    Jenis: exportValue(row.jenisTransaksi),
+    Referensi: exportValue(row.sourceNoReff || row.requestId),
+    'Nominal monitoring': Number(row.amount || 0),
+    Confirmed: Number(row.confirmedAmount || 0),
+    Approval: exportStatus(row.approvalStatus || row.status),
+    Jurnal: exportStatus(row.journalStatus || 'BELUM_DIBUAT'),
+    Rekonsiliasi: exportStatus(row.reconciliationStatus || 'NOT_APPLICABLE'),
+  }));
+}
+
+export function reportExportSections(report, payload) {
+  const sections = [];
+  if (report === 'balances' && (payload.groupRows || []).length) {
+    sections.push({
+      name: 'Konsolidasi kelompok',
+      rows: payload.groupRows.map((group) => ({
+        'Kelompok Kas': exportStack(group.namaKelompokKas, group.kodeKelompokKas),
+        Unit: exportValue(group.unit),
+        'Saldo langsung': Number(group.saldoLangsung || 0),
+        'Saldo konsolidasi': Number(group.saldoKonsolidasi || 0),
+        'Jumlah akun langsung': Number(group.jumlahAkun || 0),
+      })),
+    });
+  }
+  sections.push({ name: 'Laporan', rows: reportRowsForExport(report, payload) });
+  return sections;
 }
 
 export const reportExportLimit = MAX_EXPORT_ROWS;

@@ -84,7 +84,7 @@ import {
   reportMutations,
   reportReconciliation,
   reportRequests,
-  reportRowsForExport,
+  reportExportSections,
   reportTransactions,
 } from './reporting.js';
 
@@ -5013,6 +5013,7 @@ const REPORT_EXPORT_COLORS = Object.freeze({
 
 function reportExportFilterText(filters = {}) {
   const groupLabels = { CASH_GROUP: 'Kelompok kas', ACCOUNT: 'Rekening', UNIT: 'Unit bisnis', BRANCH: 'Toko / cabang', CATEGORY: 'Kategori' };
+  const sourceLabels = { FINANCE: 'Finance', NAGAGOLD: 'Nagagold', OPTIK: 'Optik', SYNC: 'Semua sumber', SYNC_NAGAGOLD: 'Nagagold', SYNC_OPTIK: 'Optik' };
   const viewLabel = filters.view === 'detail' ? 'Detail' : filters.view === 'summary' ? 'Rekap' : '';
   const readable = (value) => String(value || '').replaceAll('_', ' ');
   return [
@@ -5020,14 +5021,13 @@ function reportExportFilterText(filters = {}) {
     filters.unit ? `Unit bisnis: ${filters.unit}` : '',
     filters.kelompokKasId ? 'Kelompok kas: Terpilih' : '',
     filters.accountId ? 'Rekening: Terpilih' : '',
-    filters.kodeToko ? `Cabang: ${filters.kodeToko}` : '',
-    filters.sourceType ? `Sumber: ${{ SYNC: 'Semua sumber', SYNC_NAGAGOLD: 'NAGAGOLD', SYNC_OPTIK: 'OPTIK' }[filters.sourceType] || readable(filters.sourceType)}` : '',
+    filters.kodeToko ? `Cabang: ${filters.unit ? `${filters.unit} · ` : ''}${filters.kodeToko}` : '',
+    filters.sourceType ? `Sumber: ${sourceLabels[filters.sourceType] || readable(filters.sourceType)}` : '',
     filters.groupBy ? `Kelompokkan: ${groupLabels[filters.groupBy] || filters.groupBy}` : '',
     viewLabel ? `Tampilan: ${viewLabel}` : '',
     filters.search ? `Pencarian: ${filters.search}` : '',
     filters.kategoriSumber ? `Kategori: ${readable(filters.kategoriSumber)}` : '',
     filters.metodePembayaran ? `Metode: ${readable(filters.metodePembayaran)}` : '',
-    `Status: ${readable(filters.journalStatus || 'POSTED')}`,
   ].filter(Boolean).join('  ·  ');
 }
 
@@ -5068,33 +5068,11 @@ function excelCellWidth(key, rows) {
 }
 
 async function sendExcelExport(report, payload, res) {
-  const rows = reportRowsForExport(report, payload);
+  const sections = reportExportSections(report, payload);
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Finance Sambas';
   workbook.created = new Date();
-  const sheet = workbook.addWorksheet('Laporan');
-  const keys = rows.length ? Object.keys(rows[0]) : ['Keterangan'];
-  sheet.columns = keys.map((key) => ({ key, width: excelCellWidth(key, rows) }));
   const filters = payload.filters || {};
-  const filterText = reportExportFilterText(filters);
-  const lastColumn = excelColumnLetter(keys.length);
-  sheet.addRow(['FINANCE SAMBAS']);
-  sheet.addRow([exportTitle(report)]);
-  sheet.addRow([filterText]);
-  sheet.addRow([`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}  ·  ${rows.length} data`]);
-  sheet.addRow([]);
-  const headerRow = sheet.addRow(keys);
-  sheet.mergeCells(`A1:${lastColumn}1`);
-  sheet.mergeCells(`A2:${lastColumn}2`);
-  sheet.mergeCells(`A3:${lastColumn}3`);
-  sheet.mergeCells(`A4:${lastColumn}4`);
-  for (const row of rows) sheet.addRow(row);
-  const totalValues = reportExportTotals(rows, keys);
-  if (totalValues.size) {
-    const totalRow = sheet.addRow(keys.map((key, index) => index === 0 ? 'TOTAL' : totalValues.has(key) ? totalValues.get(key) : ''));
-    totalRow.font = { bold: true, color: { argb: REPORT_EXPORT_COLORS.ink } };
-    totalRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.tealLight } };
-  }
   const styleRow = (row, style = {}) => {
     row.eachCell({ includeEmpty: true }, (cell) => {
       cell.alignment = { vertical: 'middle', ...style.alignment };
@@ -5103,28 +5081,56 @@ async function sendExcelExport(report, payload, res) {
       if (style.border) cell.border = style.border;
     });
   };
-  styleRow(sheet.getRow(1), { font: { bold: true, size: 11, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.dark } }, alignment: { horizontal: 'left' } });
-  styleRow(sheet.getRow(2), { font: { bold: true, size: 15, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.dark } }, alignment: { horizontal: 'left' } });
-  styleRow(sheet.getRow(3), { font: { size: 10, color: { argb: REPORT_EXPORT_COLORS.muted } }, alignment: { horizontal: 'left', wrapText: true } });
-  styleRow(sheet.getRow(4), { font: { italic: true, size: 9, color: { argb: REPORT_EXPORT_COLORS.muted } }, alignment: { horizontal: 'left' } });
-  headerRow.height = 30;
-  styleRow(headerRow, { font: { bold: true, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.teal } }, alignment: { horizontal: 'center', vertical: 'middle', wrapText: true }, border: { top: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, bottom: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, left: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, right: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } } } });
-  for (let rowNumber = headerRow.number + 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    const row = sheet.getRow(rowNumber);
-    if (rowNumber < sheet.rowCount && (rowNumber - headerRow.number) % 2 === 0) row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.stripe } };
-    row.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
-      const key = keys[columnNumber - 1];
-      cell.alignment = { vertical: 'top', horizontal: isExportAmountKey(key) ? 'right' : 'left', wrapText: true };
-      cell.border = { bottom: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } } };
-      if (typeof cell.value === 'number') cell.numFmt = isExportAmountKey(key) ? '#,##0;[Red]-#,##0' : '#,##0';
-    });
-  }
-  sheet.views = [{ state: 'frozen', ySplit: headerRow.number }];
-  sheet.autoFilter = { from: { row: headerRow.number, column: 1 }, to: { row: headerRow.number, column: keys.length } };
-  sheet.pageSetup = { paperSize: 9, orientation: keys.length > 7 ? 'landscape' : 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0, horizontalDpi: 300, verticalDpi: 300 };
-  sheet.pageMargins = { left: 0.25, right: 0.25, top: 0.55, bottom: 0.55, header: 0.2, footer: 0.2 };
-  sheet.printTitlesRow = `${headerRow.number}:${headerRow.number}`;
-  sheet.headerFooter.oddFooter = '&LFinance Sambas&C&D&RHalaman &P dari &N';
+  const filterText = reportExportFilterText(filters);
+  const mainRows = sections[sections.length - 1]?.rows || [];
+  const dataCount = payload.total ?? mainRows.length;
+  sections.forEach((section, sectionIndex) => {
+    const rows = section.rows || [];
+    const sheetName = String(section.name || `Laporan ${sectionIndex + 1}`).slice(0, 31);
+    const sheet = workbook.addWorksheet(sheetName);
+    const keys = rows.length ? Object.keys(rows[0]) : ['Keterangan'];
+    sheet.columns = keys.map((key) => ({ key, width: excelCellWidth(key, rows) }));
+    const lastColumn = excelColumnLetter(keys.length);
+    sheet.addRow(['FINANCE SAMBAS']);
+    sheet.addRow([exportTitle(report)]);
+    sheet.addRow([section.name === 'Laporan' ? filterText : `${filterText}  ·  ${section.name}`]);
+    sheet.addRow([`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}  ·  ${dataCount} data`]);
+    sheet.addRow([]);
+    const headerRow = sheet.addRow(keys);
+    sheet.mergeCells(`A1:${lastColumn}1`);
+    sheet.mergeCells(`A2:${lastColumn}2`);
+    sheet.mergeCells(`A3:${lastColumn}3`);
+    sheet.mergeCells(`A4:${lastColumn}4`);
+    for (const row of rows) sheet.addRow(row);
+    const totalValues = reportExportTotals(rows, keys);
+    if (totalValues.size) {
+      const totalRow = sheet.addRow(keys.map((key, index) => index === 0 ? 'TOTAL' : totalValues.has(key) ? totalValues.get(key) : ''));
+      totalRow.font = { bold: true, color: { argb: REPORT_EXPORT_COLORS.ink } };
+      totalRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.tealLight } };
+    }
+    styleRow(sheet.getRow(1), { font: { bold: true, size: 11, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.dark } }, alignment: { horizontal: 'left' } });
+    styleRow(sheet.getRow(2), { font: { bold: true, size: 15, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.dark } }, alignment: { horizontal: 'left' } });
+    styleRow(sheet.getRow(3), { font: { size: 10, color: { argb: REPORT_EXPORT_COLORS.muted } }, alignment: { horizontal: 'left', wrapText: true } });
+    styleRow(sheet.getRow(4), { font: { italic: true, size: 9, color: { argb: REPORT_EXPORT_COLORS.muted } }, alignment: { horizontal: 'left' } });
+    headerRow.height = 30;
+    styleRow(headerRow, { font: { bold: true, color: { argb: REPORT_EXPORT_COLORS.white } }, fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.teal } }, alignment: { horizontal: 'center', vertical: 'middle', wrapText: true }, border: { top: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, bottom: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, left: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } }, right: { style: 'thin', color: { argb: REPORT_EXPORT_COLORS.teal } } } });
+    for (let rowNumber = headerRow.number + 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+      const row = sheet.getRow(rowNumber);
+      if (rowNumber < sheet.rowCount && (rowNumber - headerRow.number) % 2 === 0) row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: REPORT_EXPORT_COLORS.stripe } };
+      row.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
+        const key = keys[columnNumber - 1];
+        cell.alignment = { vertical: 'top', horizontal: isExportAmountKey(key) ? 'right' : 'left', wrapText: true };
+        cell.border = { bottom: { style: 'hair', color: { argb: REPORT_EXPORT_COLORS.border } } };
+        if (typeof cell.value === 'number') cell.numFmt = isExportAmountKey(key) ? '"Rp" #,##0;[Red]-"Rp" #,##0' : '#,##0';
+      });
+    }
+    sheet.views = [{ state: 'frozen', ySplit: headerRow.number }];
+    sheet.autoFilter = { from: { row: headerRow.number, column: 1 }, to: { row: headerRow.number, column: keys.length } };
+    sheet.pageSetup = { paperSize: 9, orientation: keys.length > 7 ? 'landscape' : 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0, horizontalDpi: 300, verticalDpi: 300 };
+    sheet.pageMargins = { left: 0.25, right: 0.25, top: 0.55, bottom: 0.55, header: 0.2, footer: 0.2 };
+    sheet.printTitlesRow = `${headerRow.number}:${headerRow.number}`;
+    sheet.headerFooter.oddFooter = '&LFinance Sambas&C&D&RHalaman &P dari &N';
+  });
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="finance-${report}-${new Date().toISOString().slice(0, 10)}.xlsx"`);
   await workbook.xlsx.write(res);
@@ -5135,7 +5141,10 @@ function pdfText(value) { return String(value ?? '').replace(/[\r\n]/g, ' ').rep
 
 function pdfDisplayValue(key, value) {
   if (value === null || value === undefined || value === '') return '-';
-  if (typeof value === 'number' && isExportAmountKey(key)) return new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 }).format(value);
+  if (typeof value === 'number' && isExportAmountKey(key)) {
+    const absolute = new Intl.NumberFormat('id-ID', { maximumFractionDigits: 0 }).format(Math.abs(value));
+    return value < 0 ? `-Rp ${absolute}` : `Rp ${absolute}`;
+  }
   return pdfText(value);
 }
 
@@ -5199,9 +5208,12 @@ function drawPdfTable(document, report, rows, keys, margin, startY, contentWidth
 }
 
 async function sendPdfExport(report, payload, res) {
-  const rows = reportRowsForExport(report, payload);
-  const keys = rows.length ? Object.keys(rows[0]) : ['Keterangan'];
-  const layout = keys.length > 7 || report === 'financial' ? 'landscape' : 'portrait';
+  const sections = reportExportSections(report, payload);
+  const mainRows = sections[sections.length - 1]?.rows || [];
+  const allRows = sections.flatMap((section) => section.rows || []);
+  const keys = allRows.length ? Object.keys(allRows.find((row) => Object.keys(row).length) || allRows[0]) : ['Keterangan'];
+  const maxColumnCount = Math.max(1, ...sections.map((section) => Object.keys(section.rows?.[0] || {}).length));
+  const layout = maxColumnCount > 7 || report === 'financial' ? 'landscape' : 'portrait';
   const margin = layout === 'landscape' ? 28 : 32;
   const document = new PDFDocument({ size: 'A4', layout, margin, bufferPages: true });
   const contentWidth = document.page.width - margin * 2;
@@ -5217,10 +5229,21 @@ async function sendPdfExport(report, payload, res) {
   document.y = 92;
   document.font('Helvetica').fontSize(8).fillColor('#607780').text(reportExportFilterText(payload.filters || {}), margin, document.y, { width: contentWidth });
   document.moveDown(0.5);
-  document.font('Helvetica-Oblique').fontSize(7.5).fillColor('#8A989D').text(`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}  ·  ${rows.length} data`, margin, document.y, { width: contentWidth });
+  document.font('Helvetica-Oblique').fontSize(7.5).fillColor('#8A989D').text(`Dibuat: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}  ·  ${payload.total ?? mainRows.length} data`, margin, document.y, { width: contentWidth });
   document.moveDown(1.1);
-  if (!rows.length) document.font('Helvetica').fontSize(10).fillColor('#333333').text('Tidak ada data sesuai filter.', margin, document.y, { width: contentWidth });
-  else drawPdfTable(document, report, rows, keys, margin, document.y, contentWidth);
+  if (!allRows.length) document.font('Helvetica').fontSize(10).fillColor('#333333').text('Tidak ada data sesuai filter.', margin, document.y, { width: contentWidth });
+  else sections.forEach((section, sectionIndex) => {
+    const rows = section.rows || [];
+    if (sectionIndex > 0 || sections.length > 1) {
+      if (document.y + 42 > document.page.height - 58) {
+        document.addPage();
+        document.y = 46;
+      }
+      document.font('Helvetica-Bold').fontSize(10).fillColor('#26343B').text(section.name, margin, document.y, { width: contentWidth });
+      document.moveDown(0.45);
+    }
+    if (rows.length) drawPdfTable(document, report, rows, Object.keys(rows[0]), margin, document.y, contentWidth);
+  });
   const pages = document.bufferedPageRange();
   for (let index = 0; index < pages.count; index++) {
     document.switchToPage(index);
