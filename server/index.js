@@ -337,7 +337,7 @@ async function recalculateBalanceSnapshots(tanggal, rekeningIds = [], actorName 
             dihitung_pada: now(),
             catatan: '',
           },
-          $setOnInsert: { rekening_id: rekeningId, tanggal_tutup: date, versi: 0 },
+          $setOnInsert: { rekening_id: rekeningId, tanggal_tutup: date },
           $inc: { versi: 1 },
         },
         upsert: true,
