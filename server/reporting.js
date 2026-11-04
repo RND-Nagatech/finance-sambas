@@ -1011,6 +1011,43 @@ function financialGroupStats(row) {
   return stats;
 }
 
+function buildFinancialBranchRows(entries, dateFrom, dateTo) {
+  const grouped = new Map();
+  for (const row of entries) {
+    const source = String(row.source || row.unit || 'FINANCE').trim().toUpperCase() || 'FINANCE';
+    const branchCode = String(row.kodeToko || '').trim().toUpperCase();
+    const key = branchCode ? `${source}::${branchCode}` : 'PUSAT';
+    const current = grouped.get(key) || {
+      ...emptyFinancialStats(),
+      key,
+      branchCode,
+      source,
+      namaToko: '',
+    };
+    if (row.namaToko && !current.namaToko) current.namaToko = row.namaToko;
+    if (row.date < dateFrom) current.saldoAwal += row.effect;
+    else if (row.date >= dateFrom && row.date <= dateTo) addFinancialEntry(current, row);
+    grouped.set(key, current);
+  }
+  return [...grouped.values()].map((item) => {
+    item.saldoAkhir = item.saldoAwal + item.debet - item.kredit;
+    return {
+      ...publicFinancialStats(item),
+      _eventKeys: item._eventKeys,
+      id: `branch-${item.key}`,
+      rowType: 'GROUP',
+      key: item.key,
+      label: item.branchCode ? `${item.source} · ${item.branchCode}` : 'PUSAT',
+      code: item.branchCode ? item.source : 'FINANCE',
+      unit: item.source,
+      kodeToko: item.branchCode,
+      namaToko: item.namaToko,
+      source: item.source,
+      groupBy: 'BRANCH',
+    };
+  }).sort((left, right) => left.label.localeCompare(right.label));
+}
+
 function buildFinancialGroupTree(groups, accountRows, selectedGroupId = '', includeSubgroups = false) {
   const groupMap = new Map(groups.map((group) => [String(group._id), group]));
   const childrenByParent = new Map();
@@ -1126,7 +1163,11 @@ export async function reportFinancial(input = {}) {
     return true;
   });
   const accountIds = accounts.map((account) => String(account._id));
-  const useSnapshots = status === 'POSTED' && !filters.sourceType;
+  // Snapshot saldo hanya berada pada level rekening. Untuk Rekap per cabang,
+  // saldo harus dihitung dari jurnal yang membawa konteks sumber + cabang;
+  // jika snapshot dipakai, saldo awal tidak dapat dibagi ke cabang yang benar.
+  const useSnapshots = status === 'POSTED' && !filters.sourceType
+    && !(filters.view === 'summary' && filters.groupBy === 'BRANCH');
   const snapshotByAccount = new Map();
   if (useSnapshots && accountIds.length && filters.dateFrom) {
     const snapshots = await BalanceSnapshot.find({ rekening_id: { $in: accountIds }, tanggal_tutup: { $lt: filters.dateFrom } })
@@ -1190,6 +1231,9 @@ export async function reportFinancial(input = {}) {
   const sourceFilteredEntries = ['FINANCE', 'NAGAGOLD', 'OPTIK'].includes(filters.sourceType)
     ? entries.filter((row) => row.source === filters.sourceType)
     : entries;
+  const branchSummaryRows = filters.view === 'summary' && filters.groupBy === 'BRANCH'
+    ? buildFinancialBranchRows(sourceFilteredEntries, filters.dateFrom, filters.dateTo)
+    : [];
   const accountEntries = new Map();
   for (const row of sourceFilteredEntries) accountEntries.set(row.accountId, [...(accountEntries.get(row.accountId) || []), row]);
   const accountRows = accounts.map((account) => {
@@ -1233,11 +1277,9 @@ export async function reportFinancial(input = {}) {
     // Rekap kelompok/unit/cabang harus tetap memasukkan rekening yang membawa
     // saldo dari periode sebelumnya. Rekening seperti ini bisa saja tidak
     // punya transaksi pada periode aktif, tetapi saldonya tetap membentuk
-    // saldo awal dan saldo akhir kelompok. Untuk tampilan per rekening,
-    // perilaku lama dipertahankan: rekening tanpa transaksi hanya muncul jika
-    // pengguna mengaktifkan checkbox-nya.
+    // saldo awal dan saldo akhir laporan. Checkbox tetap hanya diperlukan
+    // untuk menampilkan rekening yang benar-benar kosong.
     const rekapNeedsOpeningBalance = filters.view === 'summary'
-      && filters.groupBy !== 'ACCOUNT'
       && Number(row.saldoSebelumPeriode || 0) !== 0;
     if (rekapNeedsOpeningBalance) return true;
     if (filters.includeEmptyAccounts && !filters.kodeToko) return true;
@@ -1254,12 +1296,14 @@ export async function reportFinancial(input = {}) {
   });
   const detailRows = detailWithBalance.filter((row) => financialDetailMatches(row, filters));
   const detailPage = detailRows.slice((filters.page - 1) * filters.pageSize, filters.page * filters.pageSize);
-  const totalStats = sumFinancialStats(accountRows);
+  const summaryStatsRows = filters.groupBy === 'BRANCH' && filters.view === 'summary' ? branchSummaryRows : accountRows;
+  const totalStats = sumFinancialStats(summaryStatsRows);
   const toFlatGroupRow = (key, label, rows, extra = {}) => ({ ...sumFinancialStats(rows.map(financialGroupStats)), id: `summary-${key}`, rowType: 'GROUP', key, label, groupBy: filters.groupBy, accountNumber: filters.groupBy === 'ACCOUNT' ? rows[0]?.accountNumber || '' : '', accountName: filters.groupBy === 'ACCOUNT' ? rows[0]?.accountName || label : label, ...extra });
   let summaryRows = [];
   let groupTree = [];
   if (filters.groupBy === 'CASH_GROUP') groupTree = buildFinancialGroupTree(groups, accountRows, filters.kelompokKasId, filters.includeSubgroups);
   else if (filters.groupBy === 'ACCOUNT') summaryRows = accountRows;
+  else if (filters.groupBy === 'BRANCH') summaryRows = branchSummaryRows;
   else {
     const grouped = new Map();
     for (const row of accountRows) {
