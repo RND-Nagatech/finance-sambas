@@ -1985,13 +1985,20 @@ async function ensureSafeFinanceIndexes() {
     else console.warn('Index cursor sinkronisasi ditunda karena ada state sumber duplikat.');
   }
 
+  const expectedSyncIndexes = [
+    { name: 'uniq_tt_sinkronisasi_sumber_database', key: { sumber: 1, database_name: 1, kode_toko: 1, id_sumber: 1 }, unique: true },
+    { name: 'tanggal_-1_kode_toko_1', key: { tanggal: -1, kode_toko: 1 }, unique: false },
+    { name: 'status_1_tanggal_-1', key: { status: 1, tanggal: -1 }, unique: false },
+    { name: 'rekening_id_1_tanggal_-1', key: { rekening_id: 1, tanggal: -1 }, unique: false },
+  ];
   const syncIndexes = await SyncTransaction.collection.indexes();
-  for (const legacyIndex of syncIndexes) {
-    const key = JSON.stringify(legacyIndex.key || {});
-    const isLegacyTransactionNumberIndex = Object.prototype.hasOwnProperty.call(legacyIndex.key || {}, 'transactionNumber');
-    if ((key === JSON.stringify({ sumber: 1, kode_toko: 1, id_sumber: 1 }) || isLegacyTransactionNumberIndex) && legacyIndex.name !== '_id_') {
-      await SyncTransaction.collection.dropIndex(legacyIndex.name);
-      if (isLegacyTransactionNumberIndex) console.info(`Index sinkronisasi lama ${legacyIndex.name} dihapus; identitas transaksi kini memakai sumber + database + toko + ID sumber.`);
+  for (const index of syncIndexes) {
+    if (index.name === '_id_') continue;
+    const expected = expectedSyncIndexes.find((item) => JSON.stringify(item.key) === JSON.stringify(index.key || {}));
+    const isExpected = expected && expected.name === index.name && Boolean(expected.unique) === Boolean(index.unique);
+    if (!isExpected) {
+      await SyncTransaction.collection.dropIndex(index.name);
+      console.info(`Index sinkronisasi lama ${index.name} dihapus; hanya index yang sesuai struktur terbaru yang dipertahankan.`);
     }
   }
   const currentSyncIndexes = await SyncTransaction.collection.indexes();
@@ -2049,6 +2056,13 @@ async function ensureSafeFinanceIndexes() {
   const accountIndexes = await Account.collection.indexes();
   const legacyAccountIndex = accountIndexes.find((index) => JSON.stringify(index.key) === JSON.stringify({ bentuk_saldo: 1, unit: 1, kode_toko: 1 }));
   if (legacyAccountIndex) await Account.collection.dropIndex(legacyAccountIndex.name);
+  for (const index of accountIndexes) {
+    const isLegacyAccountCodeIndex = JSON.stringify(index.key || {}) === JSON.stringify({ kode_akun: 1 }) && index.name !== 'uniq_account_code';
+    if (isLegacyAccountCodeIndex && index.name !== '_id_') {
+      await Account.collection.dropIndex(index.name);
+      console.info(`Index kode akun lama ${index.name} dihapus; hanya index unik kode akun yang dipertahankan.`);
+    }
+  }
   if (!accountIndexes.some((index) => index.name === 'uniq_active_cash_account_kind')) {
     const duplicateCash = await Account.collection.aggregate([
       { $match: { bentuk_saldo: 'KAS_TUNAI', aktif: true, jenis_akun: { $in: [ACCOUNT_KINDS.STORE_CASH, ACCOUNT_KINDS.OPERATING_CASH] } } },
